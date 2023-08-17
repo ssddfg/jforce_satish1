@@ -1,0 +1,33 @@
+    <template>
+        
+        <lightning-card title="Record Edit Form">
+            <lightning-record-edit-form
+            object-api-name={objectName} onsuccess= {successHandler}>
+               
+                <lightning-messages>qwww</lightning-messages>
+                <p>11121</p>
+                <!--lightning-input-field field-name={fields.accountField}></lightning-input-field-->
+                <lightning-input-field field-name={fields.nameField} required="true"></lightning-input-field>
+                <lightning-input-field field-name={fields.contactField} required="true"></lightning-input-field>
+                <lightning-input-field field-name={fields.subjectField} required="true"></lightning-input-field>
+                <lightning-input-field field-name={fields.appointmentDateField} required="true"></lightning-input-field>
+                <lightning-input-field field-name={fields.appointmentTimeField} required="true"></lightning-input-field>
+                <lightning-input-field field-name={fields.descriptionField} required="true"></lightning-input-field>
+                
+                <lightning-button variant="brand" 
+                label="Cancel" 
+                title="Cancel" 
+                class="slds-m-left_x-small">
+                </lightning-button>
+    
+                <lightning-button variant="brand" 
+                label="Save" 
+                title="Save" 
+                type="submit"
+                class="slds-m-left_x-small">
+                </lightning-button>
+    
+            </lightning-record-edit-form>
+        </lightning-card>
+    </template>
+    
