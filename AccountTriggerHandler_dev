@@ -1,0 +1,1953 @@
+/******************************************************************************
+*change log*
+*21-07-2023 - change made by tilak- updated Duplication logic SF-1138 (old-SFTRK-216)
+*31-10-2023 - change made by tilak- added Registered__c  (SF-1616)
+*06-12-2023 - chnage madde by tilak- Pipes_and_Tubes__c added in account stage updates (SF-1821)
+*25-02-2025 - createContactsForNewAccounts method added by Pranav , SF-3520
+*05-03-2025 - updatePanFromGst method Added by Sai Kiran, SF-3601
+*11-03-2025 - updatePayToForNewAccounts,updatePayToForExisitngAccounts Added Methods by Sai Kiran SF-3441 
+*24/04/2025c- updateVAN method added, SF-3585, pranav
+*09/05/2025 - accountTriggerStop added this static variable to bypass SOQL 101 as part of SF-3753
+*09/05/2025 - added !System.isfuture & !System.isbatch part of SF-3824
+*23/06/2025 - added after trigger to retrive Retail owner and Influencer owner change account Ids part of SF-4220
+*14/07/2025 - change made by tilak- RecordType query removed and schema used
+*8-8-2025 - chnage made by tilak - Account Trigger Optimisation SF-4373
+*13-04-2026 - SF-5025 - change made by shrishty
+*16-07-2026 - SF-5714 - chnage made by tilak- added SHip to account record type in duplication logic, accountPreventDuplicate accountDeduplication
+*10/08/2026 - Shekhar -SF-5892, updated afterUpdateMethod method logic for Influencer distributor.
+*19-08-2026 - changes made by Adwitiya - SF-5725
+*29-10-2026 - changes made by Adwitiya - JSWOC-22351
+*02-11-2026 - changes made by Lohit - JSWOC-22336-22351 - Added VAN Details notification trigger by calling Queueable class 
+
+*****************************************************************************/
+public class AccountTriggerHandler {
+    
+    public static Boolean hasRunUpdatePayTo = false;//SF-5725
+    
+    public static boolean stopTrigger = false;
+    public static boolean accountTriggerStop = false;
+    public static String cachedProfileName = null;//SF-5717
+    public class TokenRequest {
+        public string email;
+        public string password;
+        public string storeKey;
+    }
+    
+    public class TokenResponse {
+        public string jwtToken;
+    }
+
+    
+    public void beforeInsertMethod(List<Account> triggerNew){
+        
+        Id Ship_to_AccountRecordType = Schema.SObjectType.Account.getRecordTypeInfosByDeveloperName().get('Ship_to_Account').getRecordTypeId();
+        
+        for(Account objAcc : triggerNew){
+            
+            if(!Test.isRunningTest() && objAcc.RecordTypeId != Ship_to_AccountRecordType && objAcc.Registered__c == false && objAcc.Mild_Steel__c == false && objAcc.Stainless_Steel__c == false && objAcc.Structural_steel__c == false && objAcc.Welding_consumables__c == false && objAcc.Pipes_and_Tubes__c == false){
+                objAcc.Account_Status__c = 'Qualification Pending';
+            }
+            else if (!Test.isRunningTest() && objAcc.Account_Status__c != 'Dormant' && objAcc.Registered__c == true && objAcc.Mild_Steel__c == false && objAcc.Stainless_Steel__c == false && objAcc.Structural_steel__c == false && objAcc.Welding_consumables__c == false && objAcc.Pipes_and_Tubes__c == false){
+                objAcc.Account_Status__c = 'New';
+            }
+            
+            if(objAcc.AccountSource != null && objAcc.Lead_Sub_Source__c != null && objAcc.utm_source__c != null && objAcc.utm_medium__c != null){//&& objAcc.utm_campaign__c != null
+                if(objAcc.AccountSource.equalsIgnoreCase('marketing') && objAcc.Lead_Sub_Source__c.equalsIgnoreCase('digital marketing') && objAcc.utm_source__c.containsIgnoreCase('facebookads') && objAcc.utm_medium__c.containsIgnoreCase('blackcoffee') ){ //&& objAcc.utm_campaign__c.containsIgnoreCase('direct-registration-conversion'))
+
+                    objAcc.Facebook_ads_reassignment__c = true;
+                }
+            }
+        }
+        accountDeduplication(triggerNew);
+    }
+    
+    public void beforeUpdateMethod(List<Account> triggerNew,Map<Id,Account> oldMap){
+        
+       // Id msmeRecordTypeId =  [SELECT Id FROM RecordType WHERE DeveloperName = 'Business_Account' and SObjectType = 'Account'].Id;//SF-502 start 
+        
+        Id constructRecordTypeId = Schema.SObjectType.Account.getRecordTypeInfosByDeveloperName().get('MSME_Construct_Account').getRecordTypeId();
+        Id msmeRecordTypeId = Schema.SObjectType.Account.getRecordTypeInfosByDeveloperName().get('Business_Account').getRecordTypeId(); 
+        Id ConstructProjectRecordTypeId = Schema.SObjectType.Account.getRecordTypeInfosByDeveloperName().get('Construct_Projects').getRecordTypeId();//SF-502 
+        for(Account objAcc : triggerNew){
+            
+            if(objAcc.Last_Opportunity_Create_Date__c != null && objAcc.Last_Opportunity_Create_Date__c != oldMap.get(objAcc.Id).Last_Opportunity_Create_Date__c){
+                objAcc.Calls_Meetings_Since_Last_Opportunity__c = '0, 0';
+            }
+            
+            if(objAcc.RecordTypeId == constructRecordTypeId && oldMap.get(objAcc.Id).RecordTypeId == msmeRecordTypeId){
+                objAcc.Customer_Type_Account__c = null;
+            }
+            
+
+            if(objAcc.RecordTypeId == msmeRecordTypeId || objAcc.RecordTypeId == constructRecordTypeId || objAcc.RecordTypeId == ConstructProjectRecordTypeId){//SF-502 end 
+                
+                //added by shrishty
+                if(objAcc.Account_Status__c == 'New' && oldMap.get(objAcc.Id).Account_Status__c == 'Qualification Pending'){
+                    objAcc.Qualified_by__c = objAcc.OwnerId;
+                    objAcc.Qualification_Date_Time__c = DateTime.now();
+                }
+                
+                //end SF-844
+                if(callMoengageAfter30Mins(objAcc,oldMap.get(objAcc.Id)) == true && !System.isBatch() && !System.isFuture() ){  // SF-3824 - added System.isBatch() && System.isFuture() 
+                    objAcc.call_Moenage_after_30_mins__c = true;
+
+                }
+                if(callMoengageAfterOneWeek(objAcc,oldMap.get(objAcc.Id)) == true && !System.isBatch() && !System.isFuture()){ // SF-3824 - added System.isBatch() && System.isFuture() 
+                    objAcc.call_Moenage_after_a_week__c = true;
+
+                }
+                
+                if(objAcc.Non_serviceable__c == true && oldMap.get(objAcc.Id).Non_serviceable__c == false){
+                    objAcc.Lost_Reason__c = 'Disqualified';
+                }
+                
+                if(objAcc.Lost_Reason__c != '' && objAcc.Lost_Reason__c != null && objAcc.Lost_Reason__c != oldMap.get(objAcc.Id).Lost_Reason__c){
+                    objAcc.Account_Status__c = 'Lost';
+                    objAcc.Lost_By__c = objAcc.OwnerId;
+                    objAcc.Lost_Date_Time__c = System.now();
+                }
+                else if(objAcc.Qualification_Date_Time__c  == null && objAcc.Registered__c == false && (objAcc.Mild_Steel__c == true &&  oldMap.get(objAcc.Id).Mild_Steel__c == false) || (objAcc.Stainless_Steel__c == true &&  oldMap.get(objAcc.Id).Stainless_Steel__c == false) || (objAcc.Structural_steel__c == true &&  oldMap.get(objAcc.Id).Structural_steel__c == false) || (objAcc.Welding_consumables__c == true &&  oldMap.get(objAcc.Id).Welding_consumables__c == false) || (objAcc.Pipes_and_Tubes__c == true &&  oldMap.get(objAcc.Id).Pipes_and_Tubes__c == false)){
+                    objAcc.Account_Status__c = 'Qualified Not Registered';
+                    objAcc.Qualification_Date_Time__c = System.now();
+                    objAcc.Qualified_by__c = objAcc.OwnerId;
+                } else if (objAcc.Registered__c == false && objAcc.Account_Status__c != 'Disqualified' && objAcc.Account_Status__c != 'Qualified Not Registered' && objAcc.Account_Status__c != 'Dormant' && objAcc.Account_Status__c != 'Lost' && objAcc.Mild_Steel__c == false && objAcc.Stainless_Steel__c == false && objAcc.Structural_steel__c == false && objAcc.Welding_consumables__c == false && objAcc.Pipes_and_Tubes__c == false){
+                    objAcc.Account_Status__c = 'Qualification Pending';
+                } else if (objAcc.Registered__c == true && objAcc.Account_Status__c != 'Dormant'  
+                           && objAcc.Account_Status__c != 'Lost' && objAcc.Account_Status__c != 'Transacting' && objAcc.Account_Status__c != 'Active'){
+                    objAcc.Account_Status__c = 'New';
+                }
+                
+                if(objAcc.Registered__c == true && objAcc.Registration_Date_Time__c == null && oldMap.get(objAcc.Id).Registered__c == false){
+                    objAcc.Registration_Date_Time__c = system.now();
+                    /*
+                    if(objAcc.OwnerId != null){
+                      objAcc.Registered_by__c = objAcc.OwnerId;
+                    }else if(!lstIntegrationUser.isEmpty()){
+                      objAcc.Registered_by__c = lstIntegrationUser[0].Id;
+                    }*/
+                }
+                
+            }
+            
+        }
+        System.debug('stopTrigger--->> '+ stopTrigger);
+        if(stopTrigger == false || Test.isRunningTest()){ 
+            accountPreventDuplicate(triggerNew,oldMap);
+        }
+        
+    }
+    
+    public Boolean callMoengageAfter30Mins(Account objAcc,Account oldAcc){
+        boolean toReturn = false;
+        if(objAcc.name!=oldAcc.name || 
+           objAcc.Company_Phone__c!=oldAcc.Company_Phone__c || 
+           objAcc.Email__c!=oldAcc.Email__c || 
+           objAcc.OwnerId!=oldAcc.OwnerId || 
+           objAcc.Account_owner_email__c !=oldAcc.Account_owner_email__c ||
+           objAcc.Owner.Email!=oldAcc.Owner.Email || 
+           objAcc.Live_Opportunity_Count__c!=oldAcc.Live_Opportunity_Count__c || 
+           objAcc.Last_Opportunity_Create_Date__c!=oldAcc.Last_Opportunity_Create_Date__c || 
+           objAcc.Last_Successful_Opportunity_Create_Date__c!=oldAcc.Last_Successful_Opportunity_Create_Date__c || 
+           objAcc.Direct_Customer__c!=oldAcc.Direct_Customer__c || 
+           objAcc.Opportunity_Count__c!=oldAcc.Opportunity_Count__c || 
+           objAcc.Success_Opportunity_Count__c!=oldAcc.Success_Opportunity_Count__c || 
+           objAcc.Opportunity_Conversion__c!=oldAcc.Opportunity_Conversion__c || 
+           objAcc.Auto_District__c!=oldAcc.Auto_District__c || 
+           objAcc.Auto_State__c!=oldAcc.Auto_State__c || 
+           objAcc.Pin_Code__c!=oldAcc.Pin_Code__c || 
+           objAcc.Comments__c!=oldAcc.Comments__c ||
+           objAcc.Lost_Reason__c!=oldAcc.Lost_Reason__c ||
+           objAcc.Lost_Description__c!=oldAcc.Lost_Description__c||
+           objAcc.Registered__c!=oldAcc.Registered__c||
+           objAcc.Registration_Date_Time__c!=oldAcc.Registration_Date_Time__c ||
+           objAcc.Success_Account__c != oldAcc.Success_Account__c ||
+           objAcc.Account_Status__c != oldAcc.Account_Status__c ||
+           objAcc.Customer_Type_Account__c != oldAcc.Customer_Type_Account__c ||
+           objAcc.Business_division__c != oldAcc.Business_division__c
+          ){
+              toReturn = true;
+
+
+          }
+        return toReturn;
+    }
+    
+    public Boolean callMoengageAfterOneWeek(Account objAcc,Account oldAcc){
+        Boolean toReturn = false;
+        if( objAcc.AccountSource != oldAcc.AccountSource || 
+           objAcc.Lead_Sub_Source__c != oldAcc.Lead_Sub_Source__c || 
+           objAcc.utm_source__c != oldAcc.utm_source__c || 
+           objAcc.utm_element__c != oldAcc.utm_element__c || 
+           objAcc.utm_campaign__c != oldAcc.utm_campaign__c || 
+           objAcc.utm_medium__c != oldAcc.utm_medium__c || 
+           objAcc.utm_content__c != oldAcc.utm_content__c ||  
+           objAcc.Industrial_application2__c != oldAcc.Industrial_application2__c || 
+           objAcc.Account_potential__c != oldAcc.Account_potential__c || 
+           objAcc.Customer_Total_Tonnage__c != oldAcc.Customer_Total_Tonnage__c || 
+           objAcc.Customer_Last_Month_Tonnage__c != oldAcc.Customer_Last_Month_Tonnage__c || 
+           objAcc.Mild_Steel__c != oldAcc.Mild_Steel__c || 
+           objAcc.Stainless_Steel__c != oldAcc.Stainless_Steel__c || 
+           objAcc.Welding_consumables__c != oldAcc.Welding_consumables__c || 
+           objAcc.Structural_steel__c != oldAcc.Structural_steel__c || 
+           objAcc.Construction_Materials__c != oldAcc.Construction_Materials__c || 
+           objAcc.HR__c != oldAcc.HR__c || 
+           objAcc.CR__c != oldAcc.CR__c || 
+           objAcc.WR__c != oldAcc.WR__c || 
+           objAcc.GI__c != oldAcc.GI__c || 
+           objAcc.GL__c != oldAcc.GL__c || 
+           objAcc.PPGL__c != oldAcc.PPGL__c || 
+           objAcc.X200_Series__c != oldAcc.X200_Series__c || 
+           objAcc.X300_Series__c != oldAcc.X300_Series__c || 
+           objAcc.X400_Series__c != oldAcc.X400_Series__c || 
+           objAcc.Cement__c != oldAcc.Cement__c || 
+           objAcc.TMT__c != oldAcc.TMT__c || 
+           objAcc.RMC__c != oldAcc.RMC__c
+          ){
+              toReturn = true;
+          } 
+        return toReturn;
+
+    }
+    
+    public void afterUpdateMethod(List<Account> triggerNew,Map<Id,Account> oldMap){
+        
+        Map<Id,Id> mapAccIdToDelete = new Map<Id,Id>();
+        
+        List<Id> retailerIds = new List<Id>();   // SF-4220
+        List<Id> influencerIds = new List<Id>(); // SF-4220
+           List<Id> distributorIds = new List<Id>(); // SF-5786 //Sf-5892
+        
+        Id accRetailRecordTypeId = Schema.SObjectType.Account.getRecordTypeInfosByDeveloperName().get('Retail').getRecordTypeId();
+         Id accDistributorRecordTypeId = Schema.SObjectType.Account.getRecordTypeInfosByDeveloperName().get('Retail').getRecordTypeId();//SF-5786 //SF-5892
+        
+        for(Account acc : triggerNew){
+
+
+            
+            Account old = (Account)Trigger.oldMap.get(acc.Id);
+            
+            // SF-4220
+            if(acc.OwnerId != old.OwnerId){
+                if(acc.Customer_Type_Account__c == 'Influencer'){
+
+
+                    influencerIds.add(acc.Id);
+                }
+                if(acc.RecordTypeId == accRetailRecordTypeId){
+
+                    retailerIds.add(acc.Id);
+                }
+                //SF-5786 //SF-5892
+                if(acc.RecordTypeId == accDistributorRecordTypeId){
+
+                    distributorIds.add(acc.Id);
+                }
+            }
+
+            // SF-4220
+            
+            
+                if(acc.Customer_Id_CT__c != null && acc.Customer_Id_CT__c != ''){
+                                                                                        //SF-1616, 31-10-2023, Tilak - Registered__c added
+                    if(acc.Direct_Customer__c != oldMap.get(acc.Id).Direct_Customer__c || acc.Registered__c != oldMap.get(acc.Id).Registered__c){
+                        if (acc.Success_Account__c != oldMap.get(acc.Id).Success_Account__c){
+                            sendDirectCustomerChangeEventToAPI(true,acc.Customer_Id_CT__c,acc.Direct_Customer__c,acc.Success_Account__c,true);
+                        } else{
+                            sendDirectCustomerChangeEventToAPI(false,acc.Customer_Id_CT__c,acc.Direct_Customer__c,acc.Success_Account__c,true);
+                        }
+                    }                                                                   //SF-1616, 31-10-2023, Tilak - Registered__c added
+                    if (acc.Success_Account__c != oldMap.get(acc.Id).Success_Account__c || acc.Registered__c != oldMap.get(acc.Id).Registered__c){
+                        if (acc.Direct_Customer__c != oldMap.get(acc.Id).Direct_Customer__c){
+                            sendDirectCustomerChangeEventToAPI(true,acc.Customer_Id_CT__c,acc.Direct_Customer__c,acc.Success_Account__c,false);
+                        } else{
+                            sendDirectCustomerChangeEventToAPI(false,acc.Customer_Id_CT__c,acc.Direct_Customer__c,acc.Success_Account__c,false);
+                        }
+                    }
+                }
+                
+                
+                if(acc.Delete_Me__c == true){
+                    mapAccIdToDelete.put(acc.Id,acc.ExistingAcc__c);
+                }
+            //}
+                      
+            if(acc.Registered__c && !oldMap.get(acc.Id).Registered__c){
+                moengageRegistrationEvent(acc,True);
+            }
+            
+        }
+
+
+
+        
+        if(!System.isFuture() && !System.isBatch()){
+            DeleteAccounts(mapAccIdToDelete);
+        }
+        
+      //SF-5786 //SF-5892        
+        RetailerDistributorJunctionHandler.handleDistributorSharing(retailerIds, influencerIds,distributorIds); // SF-4220
+        
+
+    }
+    
+    public void afterInsertMethod(List<Account> triggerNew,Map<Id,Account> oldMap){
+        
+        Map<Id,Id> mapAccIdToDelete = new Map<Id,Id>();
+        
+        for(Account acc : triggerNew){
+            
+            if(acc.AccountSource != 'JSW One' && acc.Delete_Me__c == true ){
+                mapAccIdToDelete.put(acc.Id,acc.ExistingAcc__c);
+            }
+            
+            if(acc.Delete_Me__c == false && acc.Registered__c){
+                moengageRegistrationEvent(acc,false);
+            }
+        }
+        if(!System.isFuture() && !System.isBatch())
+            DeleteAccounts(mapAccIdToDelete);
+    }
+    
+    public static string getRequestToken(){
+        
+        Http h = new Http();
+        HttpRequest req = new HttpRequest();
+
+        string endPoint;
+
+       /*accountDirectCustomerAPI__c accEndPoint;
+        
+       Organization org = [SELECT IsSandbox FROM Organization LIMIT 1];
+        if(org.IsSandbox) {
+            accEndPoint = accountDirectCustomerAPI__c.getValues('qa');
+            endPoint = 'https://qa.msme.jswone.in/auth/login';
+        }else {
+
+            accEndPoint = accountDirectCustomerAPI__c.getValues('prod');
+            endPoint = 'https://www.jswonemsme.com/auth/login';
+        }*/
+        
+        accountDirectCustomerAPI__c accEndPoint = accountDirectCustomerAPI__c.getValues('accountDirectCustomerAPI');
+        endPoint = accEndPoint?.loginEndpoint__c;
+        
+        TokenRequest tokenReq = new TokenRequest();
+        tokenReq.email = accEndPoint?.username__c;
+        tokenReq.password = accEndPoint?.password__c;
+        tokenReq.storeKey = accEndPoint?.storekey__c;
+        req.setBody(JSON.serialize(tokenReq));
+        req.setMethod('POST');
+
+        req.setEndpoint(endPoint);
+        req.setHeader('Content-Type', 'application/json');
+        
+        HttpResponse hresp = h.send(req);
+        TokenResponse wResp = (TokenResponse) JSON.deserialize(hresp.getBody(), TokenResponse.class);
+        system.debug('JWT Token' + wResp.jwtToken);
+        return wResp.jwtToken;
+    }
+    
+    //Added by kavish for SF-765    
+
+    public static void customerTypeandBusinessDivision(List<Account> triggerNew, Map<Id, Account> oldMap) {
+        // Loop through the new accounts in the trigger
+        for (Account acc : triggerNew) {
+            if (acc != null && ((acc.Customer_Type_Account__c != null && (oldMap == null || oldMap.get(acc.Id) == null || oldMap.get(acc.Id).Customer_Type_Account__c != acc.Customer_Type_Account__c)))){
+                
+                // Create a request wrapper
+
+                CustTypeBusDiv.customerandbusinessWrapper request = new CustTypeBusDiv.customerandbusinessWrapper();
+                
+                // Set the request properties
+                request.customerId = acc.Customer_Id_CT__c;
+                request.companyName = acc.Name;
+                request.customerAccountType = acc.Customer_Type_Account__c;
+                request.businessDivision = acc.Business_Division__c;
+              
+                // Make the API call
+                List<CustTypeBusDiv.customerandbusinessWrapper> requestList = new List<CustTypeBusDiv.customerandbusinessWrapper>();
+                requestList.add(request);
+                
+                System.debug('Request List: ' + requestList);
+                
+                // Call the API method
+                CustTypeBusDiv.customerandbusiness(requestList);
+                
+
+
+            }
+        }
+    }
+
+    
+/**
+* Method for early knockoff processing when Account records are updated.
+*
+* This method is triggered when Account records are updated. It identifies
+* Accounts whose Early Knock Off stage has changed from "Pending" to "Approved,"
+* creates a request wrapper, and calls the JSW_EarlyKnockoff class to process
+* these records.
+*
+* @param newAccountMap A map of Id to the updated Account records.
+* @param oldAccountMap A map of Id to the previous Account records.
+* @see SF-1311 (https://jswone.atlassian.net/browse/SF-1311)
+* @see https://jswone.atlassian.net/browse/SF-2739 | Added Early zohoRequestList wrapper |Israr Alam 
+*/
+    public void earlyknockOff(Map<Id, Account> newAccountMap, Map<Id, Account> oldAccountMap) {
+        
+        // Create a list to store the request wrapper
+        List<JSW_EarlyKnockoff.EarlyKnockoffWrapper> requestList = new List<JSW_EarlyKnockoff.EarlyKnockoffWrapper>();
+        
+        // Iterate through the updated Account records
+        for (Account objAccount : newAccountMap.values()) {
+            // Check if the Early Knock Off stage has changed from "Pending" to "Approved"
+            if (objAccount.JSW_Early_Knock_Off_Stage__c == 'Approved' &&
+                oldAccountMap.get(objAccount.Id).JSW_Early_Knock_Off_Stage__c == 'Pending') {
+                    JSW_EarlyKnockoff.EarlyKnockoffWrapper request = new JSW_EarlyKnockoff.EarlyKnockoffWrapper();
+                    request.accId = objAccount.Id;
+                    request.gstin = objAccount.GST__c;
+                    request.email = objAccount.Email__c;
+                    requestList.add(request);
+                }
+        }
+        
+        // If there are matching records, call the JSW_EarlyKnockoff class
+        if (!requestList.isEmpty()) {
+            // Serialize the requestList to JSON
+            String requestListJSON = JSON.serialize(requestList);
+            
+            // Call the future method in the JSW_EarlyKnockoff class
+            JSW_EarlyKnockoff.earlyknockoffrequest(requestListJSON, JSON.serialize(newAccountMap));
+        }
+    }
+ /// Method for Early knockoff Ended here ///
+
+    @future (callout=true)
+    public static void sendDirectCustomerChangeEventToAPI(Boolean sendBoth,String AccCtId, Boolean isDirectCustomer,Boolean isSuccessAccount, Boolean IsDirectCustUpdate){
+        
+        JSONGenerator gen = JSON.createGenerator(true);
+        gen.writeStartObject();
+        gen.writeStringField('customerId', AccCtId);
+        
+        if(sendBoth == false){
+            if(IsDirectCustUpdate == true){
+                gen.writeBooleanField('isDirectCustomer', isDirectCustomer);
+            } 
+            else {
+                gen.writeStringField('salesClassification', isSuccessAccount == true ? 'success' : 'nonsuccess');
+            }
+        } 
+        else {
+            gen.writeBooleanField('isDirectCustomer', isDirectCustomer);
+            gen.writeStringField('salesClassification', isSuccessAccount == true ? 'success' : 'nonsuccess');
+        }
+        
+
+        gen.writeEndObject();
+        
+
+
+        String accessToken;
+        string endPoint;
+        accountDirectCustomerAPI__c accEndPoint = accountDirectCustomerAPI__c.getValues('accountDirectCustomerAPI');
+        
+        /*Organization org = [SELECT IsSandbox FROM Organization LIMIT 1];
+        if(org.IsSandbox) {
+            accEndPoint = accountDirectCustomerAPI__c.getValues('qa');
+        } else {
+            accEndPoint = accountDirectCustomerAPI__c.getValues('prod');
+        }*/
+        
+        if(!Test.isRunningTest()){
+            endPoint = accEndPoint.endpoint__c;
+            accessToken = getRequestToken();
+        }
+        else{
+            endPoint= 'https://qa.msme.jswone.in/auth/login';
+
+
+            accessToken = 'eyJhbGciOiJIUzUxMiJ9.eyJ0b2tlbkNyZWF0ZWRBdCI6IjIwMjMvMDkvMDQgMTI6MzM6MTUiLCJzdG9yZUtleSI6Im1zbWUiLCJ4LWNvcnJlbGF0aW9uLWlkIjoiZDljMjA0NDktOWU1NS00YzE4LTk4YzktYzJkM2NlM2E0MzQ2IiwidXNlclR5cGUiOiJSIiwiZXhwIjoxNjk2NDIyNzk1LCJ1c2VySWQiOiIyNmM0NWUyMi1iZjA5LTQ1MWUtYTFiOS05OWVhYzE4NWY4OTYiLCJ0b2tlbkV4cGlyZUF0IjoiMjAyMy8xMC8wNCAxMjozMzoxNSIsImlhdCI6MTY5MzgxMDk5NX0.6W0gKkB-5uoS1N5yN5DUpV4lanSQVE9fbVHDt6vWcS5YbUI2dnkMkMj3bCC3vCk8dSjCVXbcQjHErkqyTujiLQ';
+
+
+        }
+        
+
+        // Instantiate a new http object
+        Http h = new Http();
+
+        HttpRequest req = new HttpRequest();
+        req.setEndpoint(endPoint);
+        req.setMethod('POST');
+        req.setHeader('Content-Type', 'application/json');
+        if(accessToken != null){
+            req.setHeader('access_token', accessToken);
+        }
+        req.setBody(gen.getAsString());
+        
+        try{
+            if(accessToken != null){
+                HttpResponse res = h.send(req);
+            }
+        }catch(exception e){
+            HandleCustomException.LogException(e,null,null);
+        }
+    }
+    
+    public void accountPreventDuplicate(List<Account> triggerNew,Map<Id,Account> oldMap){
+        Id manufacturingRecordType = Schema.SObjectType.Account.getRecordTypeInfosByDeveloperName().get('Business_Account').getRecordTypeId();
+        Id constructRecordType = Schema.SObjectType.Account.getRecordTypeInfosByDeveloperName().get('MSME_Construct_Account').getRecordTypeId();
+
+        //Added for SF-2405
+        Id retailRecordType = Schema.SObjectType.Account.getRecordTypeInfosByDeveloperName().get('Retail').getRecordTypeId();
+        //SF-2632
+        Id DistributorRecordType = Schema.SObjectType.Account.getRecordTypeInfosByDeveloperName().get('Distributor').getRecordTypeId();
+        Id Ship_to_AccountRecordType = Schema.SObjectType.Account.getRecordTypeInfosByDeveloperName().get('Ship_to_Account').getRecordTypeId();
+
+        system.debug('Duplicate prevention');
+        Set<String> setGST = new Set<String>();
+        Set<String> setCTID = new Set<String>();
+        Set<String> setEmail = new Set<String>();
+        Set<String> setPhone = new Set<String>();
+        for(Account acc: triggerNew){
+            if(acc.AccountSource != 'JSW One' && (acc.RecordTypeId == Ship_to_AccountRecordType || acc.RecordTypeId == manufacturingRecordType || acc.RecordTypeId == constructRecordType ||  acc.RecordTypeId == retailRecordType || acc.RecordTypeId == DistributorRecordType )){
+                if(acc.GST__c != oldMap.get(acc.Id).GST__c){
+                    setGST.add(acc.GST__c);
+                }
+                if(acc.Customer_Id_CT__c != oldMap.get(acc.Id).Customer_Id_CT__c){
+                    setCTID.add(acc.Customer_Id_CT__c);
+                }
+                if(acc.Email__c != oldMap.get(acc.Id).Email__c){
+                    setEmail.add(acc.Email__c);
+                }
+                if(acc.Company_Phone__c != oldMap.get(acc.Id).Company_Phone__c && acc.Company_Phone__c != null && acc.Company_Phone__c.length() >= 10){
+                        setPhone.add('%'+acc.Company_Phone__c.right(10)+'%');
+                }
+            }
+        }
+        system.debug('setPhone='+setPhone);
+        
+        Map<String, List<Account>> CTDMAP = new Map<String, List<Account>>(); // CTD MAP
+        Map<String, List<Account>> GSTMAP = new Map<String, List<Account>>(); // GST MAP
+        Map<String, List<Account>> EMail = new Map<String, List<Account>>(); // Email MAP
+        Map<String, List<Account>> RPhone = new Map<String, List<Account>>(); // CTD MAP
+
+        for(Account acc : [select Id,Email__c,GST__c,Customer_Id_CT__c,Company_Phone__c 
+                           from account where Id NOT IN: triggerNew 
+                           AND (RecordTypeId =:Ship_to_AccountRecordType OR RecordTypeId =:manufacturingRecordType OR RecordTypeId =:constructRecordType OR  RecordTypeId =:retailRecordType OR RecordTypeId =:DistributorRecordType)
+                           AND ((Email__c IN:setEmail AND Email__c != null)
+                                OR (GST__c IN: setGST AND GST__c != null)
+                                OR (Customer_Id_CT__c IN: setCTID AND Customer_Id_CT__c != null)
+                                OR (Company_Phone__c LIKE: setPhone AND Company_Phone__c != null))])
+        {
+                                    if(acc.Customer_Id_CT__c != null){
+                                        if(CTDMAP.get(acc.Customer_Id_CT__c) == null){
+                                            CTDMAP.put(acc.Customer_Id_CT__c,new List<Account>());
+                                        }
+                                        CTDMAP.get(acc.Customer_Id_CT__c).add(acc);
+                                    }
+                                    if(acc.GST__c != null){
+                                        if(GSTMAP.get(acc.GST__c) == null){
+                                            GSTMAP.put(acc.GST__c,new List<Account>());
+                                        }
+                                        GSTMAP.get(acc.GST__c).add(acc);
+                                    }
+                                    if(acc.Company_Phone__c != null && acc.Company_Phone__c.length() >= 10){
+                                        if(RPhone.get(acc.Company_Phone__c) == null){
+                                            RPhone.put(acc.Company_Phone__c.right(10),new List<Account>());
+                                        }
+                                        RPhone.get(acc.Company_Phone__c.right(10)).add(acc);
+                                    }
+                                    if(acc.Email__c != null){
+                                        if(EMail.get(acc.Email__c) == null){
+                                            EMail.put(acc.Email__c,new List<Account>());
+                                        }
+                                        EMail.get(acc.Email__c).add(acc);
+                                    }
+                                }
+        system.debug('RPhone='+RPhone);
+        for(Account acc : triggerNew){
+            if(acc.Customer_Id_CT__c != null && acc.Customer_Id_CT__c != ''){
+                if(CTDMAP.get(acc.Customer_Id_CT__c) != null && CTDMAP.get(acc.Customer_Id_CT__c).size() > 0)
+                    acc.addError('An account already exists with this CT Id');
+            }
+            if(acc.GST__c != null && acc.GST__c != ''){
+                if(GSTMAP.get(acc.GST__c) != null && GSTMAP.get(acc.GST__c).size() > 0)
+                    acc.addError('An account already exists with this GSTIN');
+            }
+            //system.debug('acc.Company_Phone__c.right(10)='+acc.Company_Phone__c.right(10));
+            if(acc.Company_Phone__c != null && acc.Company_Phone__c.length() >= 10 && acc.Company_Phone__c != ''){
+                if(RPhone.get(acc.Company_Phone__c.right(10)) != null && RPhone.get(acc.Company_Phone__c.right(10)).size() > 0)
+                    acc.addError('An account already exists with this Phone');
+            }
+            if(acc.Email__c != null && acc.Email__c != ''){
+                if(EMail.get(acc.Email__c) != null && EMail.get(acc.Email__c).size() > 0)
+                    acc.addError('An account already exists with this Email');
+            }
+        }
+    }
+    
+    public void accountDeduplication(List<Account> triggerNew){
+        system.debug('INSIDE::accountDeduplication');
+        
+        Set<String> setGST = new Set<String>();
+        Set<String> setCTID = new Set<String>();
+        Set<String> setEmail = new Set<String>();
+        Set<String> setPhone = new Set<String>();
+        Set<Id> setTriggerNew = new Set<Id>();
+        Set<Id> setPlatEvents = new Set<Id>();
+        Id manufacturingRecordType = Schema.SObjectType.Account.getRecordTypeInfosByDeveloperName().get('Business_Account').getRecordTypeId();
+        Id constructRecordType = Schema.SObjectType.Account.getRecordTypeInfosByDeveloperName().get('MSME_Construct_Account').getRecordTypeId();               
+
+        //SF-2405
+        Id retailRecordType = Schema.SObjectType.Account.getRecordTypeInfosByDeveloperName().get('Retail').getRecordTypeId();
+        //SF-2632
+        Id DistributorRecordType = Schema.SObjectType.Account.getRecordTypeInfosByDeveloperName().get('Distributor').getRecordTypeId();
+		Id Ship_to_AccountRecordType = Schema.SObjectType.Account.getRecordTypeInfosByDeveloperName().get('Ship_to_Account').getRecordTypeId();
+            
+        for(Account acc: triggerNew){
+            if(acc.AccountSource != 'JSW One' && (acc.RecordTypeId == Ship_to_AccountRecordType || acc.RecordTypeId == manufacturingRecordType || acc.RecordTypeId == constructRecordType || acc.RecordTypeId == retailRecordType || acc.RecordTypeId == DistributorRecordType) ){
+                setGST.add(acc.GST__c);
+                setCTID.add(acc.Customer_Id_CT__c);
+                setEmail.add(acc.Email__c);
+                if(acc.Company_Phone__c != null && acc.Company_Phone__c.length() >= 10)
+                    setPhone.add('%'+acc.Company_Phone__c.right(10)+'%');
+            }
+        }
+        
+        Map<String, List<Account>> CTDMAP = new Map<String, List<Account>>(); // CTD MAP
+        Map<String, List<Account>> GSTMAP = new Map<String, List<Account>>(); // GST MAP
+        Map<String, List<Account>> EMail = new Map<String, List<Account>>(); // Email MAP
+        Map<String, List<Account>> RPhone = new Map<String, List<Account>>(); // CTD MAP
+        Set<Id> accId = new Set<Id>();
+        
+        //if(AccList != null && AccList.size() > 0){
+        for(Account acc : [select Id,Account_Status__c,AccountSource,Default_Shipping_Address_Id__c,Billing_Address_Id__c,
+                           attr__c,utm_medium__c,utm_content__c,utm_campaign__c,utm_element__c,utm_source__c,Razorpay_VAID__c,
+                           AccountNumber,Bank_name__c,IFSC_code__c,Razorpay_Entity__c,Razorpay_BA__c,Razorpay_Customer_Id__c,
+                           Blacklist_Description__c,Blacklist_Reason__c,Blacklist__c,Is_Seller__c,Registered__c,GSTIN_Status__c,PAN__c,
+                           GST__c,Legal_Name__c,CT_Email__c,Customer_Id_CT__c,Email__c,Contact_Name__c,Company_Phone__c,Name,
+                           RecordTypeId,Lead_Sub_Source__c,Pin_Code__c,Registration_Date_Time__c
+                           from account where Id NOT IN: triggerNew 
+                           AND ( RecordTypeId =:Ship_to_AccountRecordType OR RecordTypeId =:manufacturingRecordType OR RecordTypeId =:constructRecordType OR RecordTypeId =:retailRecordType OR RecordTypeId =:DistributorRecordType) 
+
+                           AND ((Email__c IN:setEmail AND Email__c != null)
+                                OR (GST__c IN: setGST AND GST__c != null)
+                                OR (Customer_Id_CT__c IN: setCTID AND Customer_Id_CT__c != null)
+                                OR (Company_Phone__c LIKE: setPhone AND Company_Phone__c != null)
+                               )]) // removed Oppty_count_1_deleted_non_deleted__c, SF-5308
+        {
+            if(acc.Customer_Id_CT__c != null){
+                if(CTDMAP.get(acc.Customer_Id_CT__c) == null){
+                    CTDMAP.put(acc.Customer_Id_CT__c,new List<Account>());
+                }
+                CTDMAP.get(acc.Customer_Id_CT__c).add(acc);
+            }
+            if(acc.GST__c != null){
+                if(GSTMAP.get(acc.GST__c) == null){
+                    GSTMAP.put(acc.GST__c,new List<Account>());
+                }
+                GSTMAP.get(acc.GST__c).add(acc);
+            }
+            if(acc.Company_Phone__c != null && acc.Company_Phone__c.length() >= 10){
+                if(RPhone.get(acc.Company_Phone__c) == null){
+                    RPhone.put(acc.Company_Phone__c.right(10),new List<Account>());
+                }
+                RPhone.get(acc.Company_Phone__c.right(10)).add(acc);
+            }
+            if(acc.Email__c != null){
+                if(EMail.get(acc.Email__c) == null){
+                    EMail.put(acc.Email__c,new List<Account>());
+                }
+                EMail.get(acc.Email__c).add(acc);
+            }
+        }
+        
+        //}
+        List<Account> lstAccToUpdate = new List<Account>();
+        List<Task> lstTask = new List<Task>();
+        List<CreateTaskForDuplicateAccount__e> tskEvents = new List<CreateTaskForDuplicateAccount__e>();
+        
+        for(Account accV : triggerNew){
+            
+            if((accV.Customer_Id_CT__c != null) && CTDMAP.containsKey(accV.Customer_Id_CT__c) && CTDMAP.get(accV.Customer_Id_CT__c).size() > 0)
+            {
+                system.debug('Inside-accountDeduplication-for loop- ct id found');
+                system.debug('CTDMAP.get(accV.Customer_Id_CT__c)[0].Account_Status__c='+CTDMAP.get(accV.Customer_Id_CT__c)[0].Account_Status__c);
+                
+                if(CTDMAP.get(accV.Customer_Id_CT__c)[0].Account_Status__c != 'Lost')
+                {
+                    system.debug('Inside-accountDeduplication-for loop- existing account NOT LOST');
+                    
+                    if(accV.Registered__c == false)
+                    {
+                        system.debug('Inside-accountDeduplication-for loop- NEW account NOT REGISTERED');
+                        if(!setPlatEvents.contains(CTDMAP.get(accV.Customer_Id_CT__c)[0].Id)){
+                            setPlatEvents.add(CTDMAP.get(accV.Customer_Id_CT__c)[0].Id);
+                            tskEvents.add(new CreateTaskForDuplicateAccount__e(AccountId__c=CTDMAP.get(accV.Customer_Id_CT__c)[0].Id));
+                        }
+                        
+                        EventBus.publish(tskEvents);
+                        accV.addError('Account already exists with same information');
+                        
+                    }
+                    else
+                    {
+                        system.debug('Inside-accountDeduplication-for loop- NEW account REGISTERED');
+                        
+                        for(Account existingAcc : CTDMAP.get(accV.Customer_Id_CT__c))
+                        {
+                            existingAcc.Facebook_ads_reassignment__c = accV.Facebook_ads_reassignment__c;
+                            existingAcc.RecordTypeId = accV.RecordTypeId;
+                            existingAcc.Name = accV.Name;
+                            existingAcc.Company_Phone__c = accV.Company_Phone__c;
+                            existingAcc.Contact_Name__c = accV.Contact_Name__c;
+                            existingAcc.Email__c = accV.Email__c;
+                            existingAcc.Customer_Id_CT__c = accV.Customer_Id_CT__c;
+                            existingAcc.CT_Email__c = accV.CT_Email__c;
+                            existingAcc.Legal_Name__c = accV.Legal_Name__c;
+                            existingAcc.GST__c = accV.GST__c;
+                            existingAcc.PAN__c = accV.PAN__c;
+                            existingAcc.GSTIN_Status__c = accV.GSTIN_Status__c;
+                            existingAcc.Registered__c = accV.Registered__c;
+                            existingAcc.Is_Seller__c = accV.Is_Seller__c;
+                            existingAcc.Blacklist__c = accV.Blacklist__c;
+                            existingAcc.Blacklist_Reason__c = accV.Blacklist_Reason__c;
+                            existingAcc.Blacklist_Description__c = accV.Blacklist_Description__c;
+                            existingAcc.Razorpay_Customer_Id__c = accV.Razorpay_Customer_Id__c;
+                            existingAcc.Razorpay_BA__c = accV.Razorpay_BA__c;
+                            existingAcc.Razorpay_Entity__c = accV.Razorpay_Entity__c;
+                            existingAcc.IFSC_code__c = accV.IFSC_code__c;
+                            existingAcc.Bank_name__c = accV.Bank_name__c;
+                            existingAcc.AccountNumber = accV.AccountNumber;
+                            existingAcc.Razorpay_VAID__c = accV.Razorpay_VAID__c;
+                            //existingAcc.utm_source__c = accV.utm_source__c;
+                            //existingAcc.utm_element__c = accV.utm_element__c;
+                            // existingAcc.utm_campaign__c = accV.utm_campaign__c;
+                            //existingAcc.utm_content__c = accV.utm_content__c;
+                            //existingAcc.utm_medium__c = accV.utm_medium__c;
+                            existingAcc.attr__c = accV.attr__c;
+                            existingAcc.Billing_Address_Id__c = accV.Billing_Address_Id__c;
+                            existingAcc.Default_Shipping_Address_Id__c = accV.Default_Shipping_Address_Id__c;
+                            //existingAcc.AccountSource = accV.AccountSource;
+                            //existingAcc.Lead_Sub_Source__c = accV.Lead_Sub_Source__c;
+                            //existingAcc.Oppty_count_1_deleted_non_deleted__c = existingAcc.Oppty_count_1_deleted_non_deleted__c + (accV.Oppty_count_1_deleted_non_deleted__c - 1); commented, SF-5308
+                            if(accV.Pin_Code__c !=null){ existingAcc.Pin_Code__c=accV.Pin_Code__c; }
+                            existingAcc.Registration_Date_Time__c=accV.Registration_Date_Time__c;
+                            
+                            lstAccToUpdate.add(existingAcc);
+                        }
+                        if(!System.isBatch() && !System.isFuture() )  // SF-3824
+                        	accV.Delete_Me__c = true;
+                        accV.ExistingAcc__c = CTDMAP.get(accV.Customer_Id_CT__c)[0].Id;
+                    }
+                    
+                }
+                else if(CTDMAP.get(accV.Customer_Id_CT__c)[0].Account_Status__c == 'Lost' && CTDMAP.get(accV.Customer_Id_CT__c)[0].Registered__c == false)
+                {
+                    system.debug('Inside-accountDeduplication-for loop- Existing account NOT REGISTERED AND LOST');
+                    
+                    for(Account existingAcc : CTDMAP.get(accV.Customer_Id_CT__c))
+                    {
+                        existingAcc.GST__c = '';
+                        existingAcc.Email__c = '';
+                        existingAcc.Company_Phone__c = '';
+                        lstAccToUpdate.add(existingAcc);
+                    }
+                }
+                else if(CTDMAP.get(accV.Customer_Id_CT__c)[0].Account_Status__c == 'Lost' && CTDMAP.get(accV.Customer_Id_CT__c)[0].Registered__c == true)
+                {
+                    system.debug('Inside-accountDeduplication-for loop- Existing account REGISTERED AND LOST');
+                    
+                    for(Account existingAcc : CTDMAP.get(accV.Customer_Id_CT__c))
+                    {
+                       
+                        existingAcc.Account_Status__c = accV.Account_Status__c;
+                        existingAcc.RecordTypeId = accV.RecordTypeId;
+                        existingAcc.Name = accV.Name;
+                        /******below commented on 21-07-2023******
+                        existingAcc.Contact_Name__c = accV.Contact_Name__c;
+                        existingAcc.Company_Phone__c = accV.Company_Phone__c;
+                        existingAcc.Email__c = accV.Email__c;
+                        existingAcc.Customer_Id_CT__c = accV.Customer_Id_CT__c;
+                        existingAcc.CT_Email__c = accV.CT_Email__c;
+                        existingAcc.Legal_Name__c = accV.Legal_Name__c;
+                        existingAcc.GST__c = accV.GST__c;
+                        existingAcc.PAN__c = accV.PAN__c;
+                        existingAcc.GSTIN_Status__c = accV.GSTIN_Status__c;
+                        //existingAcc.Registered__c = accV.Registered__c;
+                        existingAcc.Is_Seller__c = accV.Is_Seller__c;
+                        existingAcc.Blacklist__c = accV.Blacklist__c;
+                        existingAcc.Blacklist_Reason__c = accV.Blacklist_Reason__c;
+                        existingAcc.Blacklist_Description__c = accV.Blacklist_Description__c;
+                        existingAcc.Razorpay_Customer_Id__c = accV.Razorpay_Customer_Id__c;
+                        existingAcc.Razorpay_BA__c = accV.Razorpay_BA__c;
+                        existingAcc.Razorpay_Entity__c = accV.Razorpay_Entity__c;
+                        existingAcc.IFSC_code__c = accV.IFSC_code__c;
+                        existingAcc.Bank_name__c = accV.Bank_name__c;
+                        existingAcc.AccountNumber = accV.AccountNumber;
+                        existingAcc.Razorpay_VAID__c = accV.Razorpay_VAID__c;
+                        existingAcc.Facebook_ads_reassignment__c = accV.Facebook_ads_reassignment__c;
+*/
+/* existingAcc.utm_source__c = accV.utm_source__c;
+existingAcc.utm_element__c = accV.utm_element__c;
+existingAcc.utm_campaign__c = accV.utm_campaign__c;
+existingAcc.utm_content__c = accV.utm_content__c;
+existingAcc.utm_medium__c = accV.utm_medium__c;*/
+                        
+/******below commented on 21-07-2023******
+                        existingAcc.attr__c = accV.attr__c;
+                        existingAcc.Billing_Address_Id__c = accV.Billing_Address_Id__c;
+                        existingAcc.Default_Shipping_Address_Id__c = accV.Default_Shipping_Address_Id__c;
+                        //existingAcc.AccountSource = accV.AccountSource;
+                        //existingAcc.Lead_Sub_Source__c = accV.Lead_Sub_Source__c;
+                        existingAcc.Oppty_count_1_deleted_non_deleted__c = existingAcc.Oppty_count_1_deleted_non_deleted__c + (accV.Oppty_count_1_deleted_non_deleted__c - 1);
+                        if(accV.Pin_Code__c !=null){ existingAcc.Pin_Code__c=accV.Pin_Code__c; }
+                        existingAcc.Registration_Date_Time__c=accV.Registration_Date_Time__c;
+*/
+                        lstAccToUpdate.add(existingAcc);
+                        
+                        Task t = new Task();
+                        t.WhatId = existingAcc.Id;
+                        t.Subject='Call back on customer';
+                        //t.Description = 'Customer has engaged with a digital marketing form';commented on 21-07-2023
+                        t.Description = 'Customer reenaged: Status changed from Lost to New';
+                        t.Status='Not Started';
+                        t.Priority='Normal';
+                        lstTask.add(t);
+                        
+                    }
+                    if(!System.isBatch() && !System.isFuture() )  // SF-3824
+                    	accV.Delete_Me__c = true;
+                    accV.ExistingAcc__c = CTDMAP.get(accV.Customer_Id_CT__c)[0].Id;
+                }
+            
+            }
+            else if((accV.GST__c != null) && GSTMAP.containsKey(accV.GST__c) && GSTMAP.get(accV.GST__c).size() > 0)
+            {
+                system.debug('Inside-accountDeduplication-for loop- GST found');
+                
+                if(GSTMAP.get(accV.GST__c)[0].Account_Status__c != 'Lost')
+                {
+                    system.debug('Inside-accountDeduplication-for loop- existing account NOT LOST');
+                    
+                    if(accV.Registered__c == false)
+                    {
+                        system.debug('Inside-accountDeduplication-for loop- NEW account NOT REGISTERED');
+                        
+                        if(!setPlatEvents.contains(GSTMAP.get(accV.GST__c)[0].Id)){
+                            setPlatEvents.add(GSTMAP.get(accV.GST__c)[0].Id);
+                            tskEvents.add(new CreateTaskForDuplicateAccount__e(AccountId__c=GSTMAP.get(accV.GST__c)[0].Id));
+                        }
+                        EventBus.publish(tskEvents);
+                        accV.addError('Account already exists with same information');
+                        
+                    }
+                    else 
+                    {
+                        system.debug('Inside-accountDeduplication-for loop- NEW account REGISTERED');
+                        
+                        for(Account existingAcc : GSTMAP.get(accV.GST__c))
+                        {
+                            existingAcc.Facebook_ads_reassignment__c = accV.Facebook_ads_reassignment__c;
+                            existingAcc.RecordTypeId = accV.RecordTypeId;
+                            existingAcc.Name = accV.Name;
+                            existingAcc.Company_Phone__c = accV.Company_Phone__c;
+                            existingAcc.Contact_Name__c = accV.Contact_Name__c;
+                            existingAcc.Email__c = accV.Email__c;
+                            existingAcc.Customer_Id_CT__c = accV.Customer_Id_CT__c;
+                            existingAcc.CT_Email__c = accV.CT_Email__c;
+                            existingAcc.Legal_Name__c = accV.Legal_Name__c;
+                            existingAcc.GST__c = accV.GST__c;
+                            existingAcc.PAN__c = accV.PAN__c;
+                            existingAcc.GSTIN_Status__c = accV.GSTIN_Status__c;
+                            existingAcc.Registered__c = accV.Registered__c;
+                            existingAcc.Is_Seller__c = accV.Is_Seller__c;
+                            existingAcc.Blacklist__c = accV.Blacklist__c;
+                            existingAcc.Blacklist_Reason__c = accV.Blacklist_Reason__c;
+                            existingAcc.Blacklist_Description__c = accV.Blacklist_Description__c;
+                            existingAcc.Razorpay_Customer_Id__c = accV.Razorpay_Customer_Id__c;
+                            existingAcc.Razorpay_BA__c = accV.Razorpay_BA__c;
+                            existingAcc.Razorpay_Entity__c = accV.Razorpay_Entity__c;
+                            existingAcc.IFSC_code__c = accV.IFSC_code__c;
+                            existingAcc.Bank_name__c = accV.Bank_name__c;
+                            existingAcc.AccountNumber = accV.AccountNumber;
+                            existingAcc.Razorpay_VAID__c = accV.Razorpay_VAID__c;
+                            /* existingAcc.utm_source__c = accV.utm_source__c;
+existingAcc.utm_element__c = accV.utm_element__c;
+existingAcc.utm_campaign__c = accV.utm_campaign__c;
+existingAcc.utm_content__c = accV.utm_content__c;
+existingAcc.utm_medium__c = accV.utm_medium__c;*/
+                            existingAcc.attr__c = accV.attr__c;
+                            existingAcc.Billing_Address_Id__c = accV.Billing_Address_Id__c;
+                            existingAcc.Default_Shipping_Address_Id__c = accV.Default_Shipping_Address_Id__c;
+                            //existingAcc.AccountSource = accV.AccountSource;
+                            // existingAcc.Lead_Sub_Source__c = accV.Lead_Sub_Source__c;
+                            //existingAcc.Oppty_count_1_deleted_non_deleted__c = existingAcc.Oppty_count_1_deleted_non_deleted__c + (accV.Oppty_count_1_deleted_non_deleted__c - 1); commented out, SF-5308
+                            if(accV.Pin_Code__c !=null){ existingAcc.Pin_Code__c=accV.Pin_Code__c; }
+                            existingAcc.Registration_Date_Time__c=accV.Registration_Date_Time__c;
+                            
+                            lstAccToUpdate.add(existingAcc);
+                            
+                        }
+                        
+                        if(!System.isBatch() && !System.isFuture() )  // SF-3824
+                        	accV.Delete_Me__c = true;
+                        accV.ExistingAcc__c = GSTMAP.get(accV.GST__c)[0].Id;
+                        
+                    }
+                    
+                }
+                else if(GSTMAP.get(accV.GST__c)[0].Account_Status__c == 'Lost' && GSTMAP.get(accV.GST__c)[0].Registered__c == false)
+                {
+                    system.debug('Inside-accountDeduplication-for loop- Existing account NOT REGISTERED AND LOST');
+                    
+                    for(Account existingAcc : GSTMAP.get(accV.GST__c))
+                    {
+                        existingAcc.GST__c = '';
+                        existingAcc.Email__c = '';
+                        existingAcc.Company_Phone__c = '';
+                        lstAccToUpdate.add(existingAcc);
+                    }
+                    
+                } 
+                else if(GSTMAP.get(accV.GST__c)[0].Account_Status__c == 'Lost' && GSTMAP.get(accV.GST__c)[0].Registered__c == true)
+                {
+                    system.debug('Inside-accountDeduplication-for loop- Existing account REGISTERED AND LOST');
+                    
+                    for(Account existingAcc : GSTMAP.get(accV.GST__c))
+                    {
+                        
+                        existingAcc.Account_Status__c = accV.Account_Status__c;
+                        existingAcc.RecordTypeId = accV.RecordTypeId;
+                        existingAcc.Name = accV.Name;
+/******below commented on 21-07-2023******
+                        existingAcc.Contact_Name__c = accV.Contact_Name__c;
+                        existingAcc.Facebook_ads_reassignment__c = accV.Facebook_ads_reassignment__c;
+                        existingAcc.Company_Phone__c = accV.Company_Phone__c;
+                        existingAcc.Email__c = accV.Email__c;
+                        existingAcc.Customer_Id_CT__c = accV.Customer_Id_CT__c;
+                        existingAcc.CT_Email__c = accV.CT_Email__c;
+                        existingAcc.Legal_Name__c = accV.Legal_Name__c;
+                        existingAcc.GST__c = accV.GST__c;
+                        existingAcc.PAN__c = accV.PAN__c;
+                        existingAcc.GSTIN_Status__c = accV.GSTIN_Status__c;
+                        //existingAcc.Registered__c = accV.Registered__c;
+                        existingAcc.Is_Seller__c = accV.Is_Seller__c;
+                        existingAcc.Blacklist__c = accV.Blacklist__c;
+                        existingAcc.Blacklist_Reason__c = accV.Blacklist_Reason__c;
+                        existingAcc.Blacklist_Description__c = accV.Blacklist_Description__c;
+                        existingAcc.Razorpay_Customer_Id__c = accV.Razorpay_Customer_Id__c;
+                        existingAcc.Razorpay_BA__c = accV.Razorpay_BA__c;
+                        existingAcc.Razorpay_Entity__c = accV.Razorpay_Entity__c;
+                        existingAcc.IFSC_code__c = accV.IFSC_code__c;
+                        existingAcc.Bank_name__c = accV.Bank_name__c;
+                        existingAcc.AccountNumber = accV.AccountNumber;
+                        existingAcc.Razorpay_VAID__c = accV.Razorpay_VAID__c;
+*/
+/* existingAcc.utm_source__c = accV.utm_source__c;
+existingAcc.utm_element__c = accV.utm_element__c;
+existingAcc.utm_campaign__c = accV.utm_campaign__c;
+existingAcc.utm_content__c = accV.utm_content__c;
+existingAcc.utm_medium__c = accV.utm_medium__c;
+*/
+/******below commented on 21-07-2023******
+                        existingAcc.attr__c = accV.attr__c;
+                        existingAcc.Billing_Address_Id__c = accV.Billing_Address_Id__c;
+                        existingAcc.Default_Shipping_Address_Id__c = accV.Default_Shipping_Address_Id__c;
+                        // existingAcc.AccountSource = accV.AccountSource;
+                        //existingAcc.Lead_Sub_Source__c = accV.Lead_Sub_Source__c;
+                        existingAcc.Oppty_count_1_deleted_non_deleted__c = existingAcc.Oppty_count_1_deleted_non_deleted__c + (accV.Oppty_count_1_deleted_non_deleted__c - 1);
+                        if(accV.Pin_Code__c !=null){ existingAcc.Pin_Code__c=accV.Pin_Code__c; }
+                        existingAcc.Registration_Date_Time__c=accV.Registration_Date_Time__c;
+*/
+                        lstAccToUpdate.add(existingAcc);
+                        
+                        Task t = new Task();
+                        t.WhatId = existingAcc.Id;
+                        t.Subject='Call back on customer';
+                        //t.Description = 'Customer has engaged with a digital marketing form';commented on 21-07-2023
+                        t.Description = 'Customer reenaged: Status changed from Lost to New';
+                        t.Status='Not Started';
+                        t.Priority='Normal';
+                        lstTask.add(t);
+                        
+                    }
+                    
+                    if(!System.isBatch() && !System.isFuture() )  // SF-3824
+                    	accV.Delete_Me__c = true;
+                    accV.ExistingAcc__c = GSTMAP.get(accV.GST__c)[0].Id;
+                
+                }
+                
+            }
+            else if((accV.Company_Phone__c != null) && accV.Company_Phone__c.length() >= 10 && RPhone.containsKey(accV.Company_Phone__c) && RPhone.get(accV.Company_Phone__c).size() > 0)
+            {
+                system.debug('Inside-accountDeduplication-for loop- Phone found');
+                
+                if(RPhone.get(accV.Company_Phone__c.right(10))[0].Account_Status__c != 'Lost')
+                {
+                    system.debug('Inside-accountDeduplication-for loop- existing account NOT LOST');
+                    
+                    if(accV.Registered__c == false)
+                    {
+                        system.debug('Inside-accountDeduplication-for loop- NEW account NOT REGISTERED');
+                        
+                        if(!setPlatEvents.contains(RPhone.get(accV.Company_Phone__c.right(10))[0].Id))
+                        {
+                            setPlatEvents.add(RPhone.get(accV.Company_Phone__c.right(10))[0].Id);
+                            tskEvents.add(new CreateTaskForDuplicateAccount__e(AccountId__c=RPhone.get(accV.Company_Phone__c.right(10))[0].Id));
+                        }
+                        
+                        EventBus.publish(tskEvents);
+
+                        accV.addError('Account already exists with same information');
+                        
+                    } 
+                    else 
+                    {
+                        system.debug('Inside-accountDeduplication-for loop- NEW account REGISTERED');
+                        
+                        for(Account existingAcc : RPhone.get(accV.Company_Phone__c.right(10)))
+                        {
+                            existingAcc.Facebook_ads_reassignment__c = accV.Facebook_ads_reassignment__c;
+                            existingAcc.RecordTypeId = accV.RecordTypeId;
+                            existingAcc.Name = accV.Name;
+                            existingAcc.Company_Phone__c = accV.Company_Phone__c;
+                            existingAcc.Contact_Name__c = accV.Contact_Name__c;
+                            existingAcc.Email__c = accV.Email__c;
+                            existingAcc.Customer_Id_CT__c = accV.Customer_Id_CT__c;
+                            existingAcc.CT_Email__c = accV.CT_Email__c;
+                            existingAcc.Legal_Name__c = accV.Legal_Name__c;
+                            existingAcc.GST__c = accV.GST__c;
+                            existingAcc.PAN__c = accV.PAN__c;
+                            existingAcc.GSTIN_Status__c = accV.GSTIN_Status__c;
+                            existingAcc.Registered__c = accV.Registered__c;
+                            existingAcc.Is_Seller__c = accV.Is_Seller__c;
+                            existingAcc.Blacklist__c = accV.Blacklist__c;
+                            existingAcc.Blacklist_Reason__c = accV.Blacklist_Reason__c;
+                            existingAcc.Blacklist_Description__c = accV.Blacklist_Description__c;
+                            existingAcc.Razorpay_Customer_Id__c = accV.Razorpay_Customer_Id__c;
+                            existingAcc.Razorpay_BA__c = accV.Razorpay_BA__c;
+                            existingAcc.Razorpay_Entity__c = accV.Razorpay_Entity__c;
+                            existingAcc.IFSC_code__c = accV.IFSC_code__c;
+                            existingAcc.Bank_name__c = accV.Bank_name__c;
+                            existingAcc.AccountNumber = accV.AccountNumber;
+                            existingAcc.Razorpay_VAID__c = accV.Razorpay_VAID__c;
+                            /*  existingAcc.utm_source__c = accV.utm_source__c;
+existingAcc.utm_element__c = accV.utm_element__c;
+existingAcc.utm_campaign__c = accV.utm_campaign__c;
+existingAcc.utm_content__c = accV.utm_content__c;
+existingAcc.utm_medium__c = accV.utm_medium__c;*/
+                            existingAcc.attr__c = accV.attr__c;
+                            existingAcc.Billing_Address_Id__c = accV.Billing_Address_Id__c;
+                            existingAcc.Default_Shipping_Address_Id__c = accV.Default_Shipping_Address_Id__c;
+                            //existingAcc.AccountSource = accV.AccountSource;
+                            //existingAcc.Lead_Sub_Source__c = accV.Lead_Sub_Source__c;
+                            //existingAcc.Oppty_count_1_deleted_non_deleted__c = existingAcc.Oppty_count_1_deleted_non_deleted__c + (accV.Oppty_count_1_deleted_non_deleted__c - 1); commented , SF-5308
+                            if(accV.Pin_Code__c !=null){ existingAcc.Pin_Code__c=accV.Pin_Code__c; }
+                            existingAcc.Registration_Date_Time__c=accV.Registration_Date_Time__c;
+                            
+                            lstAccToUpdate.add(existingAcc);
+                            
+                        }
+                        
+                        if(!System.isBatch() && !System.isFuture() )  // SF-3824
+                        	accV.Delete_Me__c = true;
+                        accV.ExistingAcc__c = RPhone.get(accV.Company_Phone__c.right(10))[0].Id;
+                    
+                    }
+                    
+                } 
+                else if(RPhone.get(accV.Company_Phone__c.right(10))[0].Account_Status__c == 'Lost' && RPhone.get(accV.Company_Phone__c.right(10))[0].Registered__c == false)
+                {
+                    system.debug('Inside-accountDeduplication-for loop- Existing account NOT REGISTERED AND LOST');
+                    
+                    for(Account existingAcc : RPhone.get(accV.Company_Phone__c.right(10)))
+                    {
+                        existingAcc.GST__c = '';
+                        existingAcc.Email__c = '';
+                        existingAcc.Company_Phone__c = '';
+                        lstAccToUpdate.add(existingAcc);
+                    }
+                    
+                }
+                else if(RPhone.get(accV.Company_Phone__c.right(10))[0].Account_Status__c == 'Lost' && RPhone.get(accV.Company_Phone__c.right(10))[0].Registered__c == true)
+                {
+                    system.debug('Inside-accountDeduplication-for loop- Existing account REGISTERED AND LOST');
+                    
+                    for(Account existingAcc : RPhone.get(accV.Company_Phone__c.right(10)))
+                    {
+                        
+                        existingAcc.Account_Status__c = accV.Account_Status__c;
+                        existingAcc.RecordTypeId = accV.RecordTypeId;
+                        existingAcc.Name = accV.Name;
+/******below commented on 21-07-2023******
+                        existingAcc.Contact_Name__c = accV.Contact_Name__c;
+                        existingAcc.Facebook_ads_reassignment__c = accV.Facebook_ads_reassignment__c;
+                        existingAcc.Company_Phone__c = accV.Company_Phone__c;
+                        existingAcc.Email__c = accV.Email__c;
+                        existingAcc.Customer_Id_CT__c = accV.Customer_Id_CT__c;
+                        existingAcc.CT_Email__c = accV.CT_Email__c;
+                        existingAcc.Legal_Name__c = accV.Legal_Name__c;
+                        existingAcc.GST__c = accV.GST__c;
+                        existingAcc.PAN__c = accV.PAN__c;
+                        existingAcc.GSTIN_Status__c = accV.GSTIN_Status__c;
+                        //existingAcc.Registered__c = accV.Registered__c;
+                        existingAcc.Is_Seller__c = accV.Is_Seller__c;
+                        existingAcc.Blacklist__c = accV.Blacklist__c;
+                        existingAcc.Blacklist_Reason__c = accV.Blacklist_Reason__c;
+                        existingAcc.Blacklist_Description__c = accV.Blacklist_Description__c;
+                        existingAcc.Razorpay_Customer_Id__c = accV.Razorpay_Customer_Id__c;
+                        existingAcc.Razorpay_BA__c = accV.Razorpay_BA__c;
+                        existingAcc.Razorpay_Entity__c = accV.Razorpay_Entity__c;
+                        existingAcc.IFSC_code__c = accV.IFSC_code__c;
+                        existingAcc.Bank_name__c = accV.Bank_name__c;
+                        existingAcc.AccountNumber = accV.AccountNumber;
+                        existingAcc.Razorpay_VAID__c = accV.Razorpay_VAID__c;
+*/
+/* existingAcc.utm_source__c = accV.utm_source__c;
+existingAcc.utm_element__c = accV.utm_element__c;
+existingAcc.utm_campaign__c = accV.utm_campaign__c;
+existingAcc.utm_content__c = accV.utm_content__c;
+existingAcc.utm_medium__c = accV.utm_medium__c;*/
+                        
+/******below commented on 21-07-2023******
+                        existingAcc.attr__c = accV.attr__c;
+                        existingAcc.Billing_Address_Id__c = accV.Billing_Address_Id__c;
+                        existingAcc.Default_Shipping_Address_Id__c = accV.Default_Shipping_Address_Id__c;
+                        //existingAcc.AccountSource = accV.AccountSource;
+                        // existingAcc.Lead_Sub_Source__c = accV.Lead_Sub_Source__c;
+                        existingAcc.Oppty_count_1_deleted_non_deleted__c = existingAcc.Oppty_count_1_deleted_non_deleted__c + (accV.Oppty_count_1_deleted_non_deleted__c - 1);
+                        if(accV.Pin_Code__c !=null){ existingAcc.Pin_Code__c=accV.Pin_Code__c; }
+                        existingAcc.Registration_Date_Time__c=accV.Registration_Date_Time__c;
+*/
+                        
+                        lstAccToUpdate.add(existingAcc);
+                        
+                        Task t = new Task();
+                        t.WhatId = existingAcc.Id;
+                        t.Subject='Call back on customer';
+                        //t.Description = 'Customer has engaged with a digital marketing form';commented on 21-07-2023
+                        t.Description = 'Customer reenaged: Status changed from Lost to New';
+                        t.Status='Not Started';
+                        t.Priority='Normal';
+                        lstTask.add(t);
+                        
+                    }
+                    
+                    if(!System.isBatch() && !System.isFuture() )  // SF-3824
+                    	accV.Delete_Me__c = true;
+                    accV.ExistingAcc__c = RPhone.get(accV.Company_Phone__c.right(10))[0].Id;
+                
+                }
+                
+            } 
+            else if((accV.Email__c != null) && EMail.containsKey(accV.Email__c) && EMail.get(accV.Email__c).size() > 0)
+            {
+                system.debug('Inside-accountDeduplication-for loop- Email found');
+                
+                if(EMail.get(accV.Email__c)[0].Account_Status__c != 'Lost')
+                {
+                    system.debug('Inside-accountDeduplication-for loop- existing account NOT LOST');
+                    
+                    if(accV.Registered__c == false)
+                    {
+                        system.debug('Inside-accountDeduplication-for loop- NEW account NOT REGISTERED');
+                        
+                        if(!setPlatEvents.contains(EMail.get(accV.Email__c)[0].Id))
+                        {
+                            setPlatEvents.add(EMail.get(accV.Email__c)[0].Id);
+                            tskEvents.add(new CreateTaskForDuplicateAccount__e(AccountId__c=EMail.get(accV.Email__c)[0].Id));
+                        }
+                        EventBus.publish(tskEvents);
+                        accV.addError('Account already exists with same information');
+                        
+                    } 
+                    else 
+                    {
+                        system.debug('Inside-accountDeduplication-for loop- NEW account REGISTERED');
+                        
+                        for(Account existingAcc : EMail.get(accV.Email__c))
+                        {
+                            existingAcc.Facebook_ads_reassignment__c = accV.Facebook_ads_reassignment__c;
+                            existingAcc.RecordTypeId = accV.RecordTypeId;
+                            existingAcc.Name = accV.Name;
+                            existingAcc.Company_Phone__c = accV.Company_Phone__c;
+                            existingAcc.Contact_Name__c = accV.Contact_Name__c;
+                            existingAcc.Email__c = accV.Email__c;
+                            existingAcc.Customer_Id_CT__c = accV.Customer_Id_CT__c;
+                            existingAcc.CT_Email__c = accV.CT_Email__c;
+                            existingAcc.Legal_Name__c = accV.Legal_Name__c;
+                            existingAcc.GST__c = accV.GST__c;
+                            existingAcc.PAN__c = accV.PAN__c;
+                            existingAcc.GSTIN_Status__c = accV.GSTIN_Status__c;
+                            existingAcc.Registered__c = accV.Registered__c;
+                            existingAcc.Is_Seller__c = accV.Is_Seller__c;
+                            existingAcc.Blacklist__c = accV.Blacklist__c;
+                            existingAcc.Blacklist_Reason__c = accV.Blacklist_Reason__c;
+                            existingAcc.Blacklist_Description__c = accV.Blacklist_Description__c;
+                            existingAcc.Razorpay_Customer_Id__c = accV.Razorpay_Customer_Id__c;
+                            existingAcc.Razorpay_BA__c = accV.Razorpay_BA__c;
+                            existingAcc.Razorpay_Entity__c = accV.Razorpay_Entity__c;
+                            existingAcc.IFSC_code__c = accV.IFSC_code__c;
+                            existingAcc.Bank_name__c = accV.Bank_name__c;
+                            existingAcc.AccountNumber = accV.AccountNumber;
+                            existingAcc.Razorpay_VAID__c = accV.Razorpay_VAID__c;
+                            /*  existingAcc.utm_source__c = accV.utm_source__c;
+existingAcc.utm_element__c = accV.utm_element__c;
+existingAcc.utm_campaign__c = accV.utm_campaign__c;
+existingAcc.utm_content__c = accV.utm_content__c;
+existingAcc.utm_medium__c = accV.utm_medium__c;*/
+                            existingAcc.attr__c = accV.attr__c;
+                            existingAcc.Billing_Address_Id__c = accV.Billing_Address_Id__c;
+                            existingAcc.Default_Shipping_Address_Id__c = accV.Default_Shipping_Address_Id__c;
+                            //existingAcc.AccountSource = accV.AccountSource;
+                            // existingAcc.Lead_Sub_Source__c = accV.Lead_Sub_Source__c;
+                            //existingAcc.Oppty_count_1_deleted_non_deleted__c = existingAcc.Oppty_count_1_deleted_non_deleted__c + (accV.Oppty_count_1_deleted_non_deleted__c - 1); commented, SF-5308
+                            if(accV.Pin_Code__c !=null){ existingAcc.Pin_Code__c=accV.Pin_Code__c; }
+                            existingAcc.Registration_Date_Time__c=accV.Registration_Date_Time__c;
+                            
+                            lstAccToUpdate.add(existingAcc);
+                            
+                        }
+                        
+                        if(!System.isBatch() && !System.isFuture() )  // SF-3824
+                        	accV.Delete_Me__c = true;
+                        accV.ExistingAcc__c = EMail.get(accV.Email__c)[0].Id;
+                        
+                    }
+                    
+                } 
+                else if(EMail.get(accV.Email__c)[0].Account_Status__c == 'Lost' && EMail.get(accV.Email__c)[0].Registered__c == false)
+                {
+                    system.debug('Inside-accountDeduplication-for loop- Existing account NOT REGISTERED AND LOST');
+                    
+                    for(Account existingAcc : EMail.get(accV.Email__c))
+                    {
+                        existingAcc.GST__c = '';
+                        existingAcc.Email__c = '';
+                        existingAcc.Company_Phone__c = '';
+                        lstAccToUpdate.add(existingAcc);
+                    }
+                    
+                } 
+                else if(EMail.get(accV.Email__c)[0].Account_Status__c == 'Lost' && EMail.get(accV.Email__c)[0].Registered__c == true)
+                {
+                    system.debug('Inside-accountDeduplication-for loop- Existing account REGISTERED AND LOST');
+                    
+                    for(Account existingAcc : EMail.get(accV.Email__c))
+                    {
+                        
+                        existingAcc.Account_Status__c = accV.Account_Status__c;
+                        existingAcc.RecordTypeId = accV.RecordTypeId;
+                        existingAcc.Name = accV.Name;
+/******below commented on 21-07-2023******
+                        existingAcc.Contact_Name__c = accV.Contact_Name__c;
+                        existingAcc.Company_Phone__c = accV.Company_Phone__c;
+                        existingAcc.Facebook_ads_reassignment__c = accV.Facebook_ads_reassignment__c;
+                        existingAcc.Email__c = accV.Email__c;
+                        existingAcc.Customer_Id_CT__c = accV.Customer_Id_CT__c;
+                        existingAcc.CT_Email__c = accV.CT_Email__c;
+                        existingAcc.Legal_Name__c = accV.Legal_Name__c;
+                        existingAcc.GST__c = accV.GST__c;
+                        existingAcc.PAN__c = accV.PAN__c;
+                        existingAcc.GSTIN_Status__c = accV.GSTIN_Status__c;
+                        //existingAcc.Registered__c = accV.Registered__c;
+                        existingAcc.Is_Seller__c = accV.Is_Seller__c;
+                        existingAcc.Blacklist__c = accV.Blacklist__c;
+                        existingAcc.Blacklist_Reason__c = accV.Blacklist_Reason__c;
+                        existingAcc.Blacklist_Description__c = accV.Blacklist_Description__c;
+                        existingAcc.Razorpay_Customer_Id__c = accV.Razorpay_Customer_Id__c;
+                        existingAcc.Razorpay_BA__c = accV.Razorpay_BA__c;
+                        existingAcc.Razorpay_Entity__c = accV.Razorpay_Entity__c;
+                        existingAcc.IFSC_code__c = accV.IFSC_code__c;
+                        existingAcc.Bank_name__c = accV.Bank_name__c;
+                        existingAcc.AccountNumber = accV.AccountNumber;
+                        existingAcc.Razorpay_VAID__c = accV.Razorpay_VAID__c;
+*/
+/* existingAcc.utm_source__c = accV.utm_source__c;
+existingAcc.utm_element__c = accV.utm_element__c;
+existingAcc.utm_campaign__c = accV.utm_campaign__c;
+existingAcc.utm_content__c = accV.utm_content__c;
+existingAcc.utm_medium__c = accV.utm_medium__c;*/
+
+/******below commented on 21-07-2023******
+                        existingAcc.attr__c = accV.attr__c;
+                        existingAcc.Billing_Address_Id__c = accV.Billing_Address_Id__c;
+                        existingAcc.Default_Shipping_Address_Id__c = accV.Default_Shipping_Address_Id__c;
+                        //  existingAcc.AccountSource = accV.AccountSource;
+                        // existingAcc.Lead_Sub_Source__c = accV.Lead_Sub_Source__c;
+                        existingAcc.Oppty_count_1_deleted_non_deleted__c = existingAcc.Oppty_count_1_deleted_non_deleted__c + (accV.Oppty_count_1_deleted_non_deleted__c - 1);
+                        if(accV.Pin_Code__c !=null){ existingAcc.Pin_Code__c=accV.Pin_Code__c; }
+                        existingAcc.Registration_Date_Time__c=accV.Registration_Date_Time__c;
+*/
+                        
+                        lstAccToUpdate.add(existingAcc);
+                        
+                        Task t = new Task();
+                        t.WhatId = existingAcc.Id;
+                        t.Subject='Call back on customer';
+                        //t.Description = 'Customer has engaged with a digital marketing form';commented on 21-07-2023
+                        t.Description = 'Customer reenaged: Status changed from lost to new';
+                        t.Status='Not Started';
+                        t.Priority='Normal';
+                        lstTask.add(t);
+                        
+                    }
+                    
+                    if(!System.isBatch() && !System.isFuture())  // SF-3824
+                    	accV.Delete_Me__c = true;
+                    accV.ExistingAcc__c = EMail.get(accV.Email__c)[0].Id;
+                    
+                }
+                
+            }
+            
+        }//For Loop END
+        
+        if(lstAccToUpdate != null && lstAccToUpdate.size() > 0)
+        {
+            List<Account> lstFilteredList = new List<Account>();
+            Set<Id> UniqueSet = new Set<Id>();
+            for(Account acc: lstAccToUpdate)
+            {
+                if(!UniqueSet.contains(acc.Id) && !setTriggerNew.contains(acc.Id))
+                {
+                    UniqueSet.add(acc.Id);
+                    lstFilteredList.add(acc);
+                }
+            }
+            stopTrigger = true;
+            update lstAccToUpdate;
+        }
+        
+        if(lstTask != null && lstTask.size() > 0)
+        {
+            insert lstTask;
+        }
+        
+    }
+    
+    @future
+    public static void DeleteAccounts(Map<Id,Id> mapAccIdToDelete){
+        List<Address__c> addToUpdate = new List<Address__c>();
+        List<Address__c> addToDelete = new List<Address__c>();
+        Map<Id,List<Address__c>> mapAdd = new Map<Id,List<Address__c>>();
+        Map<Id,List<Address__c>> mapExistingAdd = new Map<Id,List<Address__c>>();
+        List<Address__c> lstAddress = new List<Address__c>();
+        List<Address__c> lstExistingAddress = new List<Address__c>();
+        
+        List<Contact> conToUpdate = new List<Contact>();
+        List<Contact> conToDelete = new List<Contact>();
+        Map<Id,List<Contact>> mapCon = new Map<Id,List<Contact>>();
+        Map<Id,List<Contact>> mapExistingCon = new Map<Id,List<Contact>>();
+        List<Contact> lstContact = new List<Contact>();
+        List<Contact> lstExistingContact = new List<Contact>();
+        
+        if(mapAccIdToDelete != null && mapAccIdToDelete.size() > 0){
+            lstAddress = [Select Id,Account__c,AddressId__c,Company_Name__c,Address_Line_1__c,Address_Line_2__c,Address_Line_3__c,District__c,City__c,State__c,PIN_Code__c,Address_Type__c,IsDefaultShippingAddress__c,Complete_Address_Line__c,IsBillingAddress__c from Address__c where Account__c IN: mapAccIdToDelete.keyset()];
+            if(lstAddress != null && lstAddress.size() > 0){
+                for(Address__c objAdd : lstAddress){
+                    if(mapAdd.get(objAdd.Account__c) == null){
+                        mapAdd.put(objAdd.Account__c, new List<Address__c>());
+                    }
+                    mapAdd.get(objAdd.Account__c).add(objAdd);
+                }
+            }
+            lstExistingAddress = [Select Id,Account__c,AddressId__c,Company_Name__c,Address_Line_1__c,Address_Line_2__c,Address_Line_3__c,District__c,City__c,State__c,PIN_Code__c,Address_Type__c,IsDefaultShippingAddress__c,Complete_Address_Line__c,IsBillingAddress__c from Address__c where Account__c IN: mapAccIdToDelete.values()];
+            if(lstExistingAddress != null && lstExistingAddress.size() > 0){
+                for(Address__c objAdd : lstExistingAddress){
+                    if(mapExistingAdd.get(objAdd.Account__c) == null){
+                        mapExistingAdd.put(objAdd.Account__c, new List<Address__c>());
+                    }
+                    mapExistingAdd.get(objAdd.Account__c).add(objAdd);
+                }
+            }
+            lstContact = [Select Id,MobilePhone,Email,AccountId,LastName from Contact where AccountId IN: mapAccIdToDelete.keyset()];
+            if(lstContact != null && lstContact.size() > 0){
+                for(Contact con : lstContact){
+                    if(mapCon.get(con.AccountId) == null){
+                        mapCon.put(con.AccountId,new List<Contact>());
+                    }
+                    mapCon.get(con.AccountId).add(con);
+                }
+            }
+            lstExistingContact = [Select Id,MobilePhone,Email,AccountId,LastName from Contact where AccountId IN: mapAccIdToDelete.values()];
+            if(lstExistingContact != null && lstExistingContact.size() > 0){
+                for(Contact con : lstExistingContact){
+                    if(mapExistingCon.get(con.AccountId) == null){
+                        mapExistingCon.put(con.AccountId,new List<Contact>());
+                    }
+                    mapExistingCon.get(con.AccountId).add(con);
+                }
+            }
+        }
+        
+        
+        List<Account> lstAcc = new List<Account>();
+        if(mapAccIdToDelete != null && mapAccIdToDelete.size() > 0){
+            for(Id accId : mapAccIdToDelete.keyset()){
+                lstAcc.add(new Account(Id=accId));
+                
+                if(mapCon != null && mapCon.get(accId) != null && mapCon.get(accId).size() > 0){
+                    for(Contact objCon : mapCon.get(accId)){
+                        if(mapExistingCon != null && mapExistingCon.get(mapAccIdToDelete.get(accId)) != null && mapExistingCon.get(mapAccIdToDelete.get(accId)).size() > 0){
+                            for(Contact objExCon : mapExistingCon.get(mapAccIdToDelete.get(accId))){
+                                if(objExCon.MobilePhone == objCon.MobilePhone || objExCon.Email == objCon.Email){
+                                    objExCon.Email = objCon.Email;
+                                    objExCon.MobilePhone = objCon.MobilePhone;
+                                    objExCon.LastName = objCon.LastName;
+                                    conToUpdate.add(objExCon);
+                                    conToDelete.add(objCon);
+                                }
+                            }
+                        }
+                        objCon.AccountId = mapAccIdToDelete.get(accId);
+                        conToUpdate.add(objCon);
+                    }
+                }
+                
+                if(mapAdd != null && mapAdd.get(accId) != null && mapAdd.get(accId).size() > 0){
+                    for(Address__c objAdd : mapAdd.get(accId)){
+                        if(mapExistingAdd != null && mapExistingAdd.get(mapAccIdToDelete.get(accId)) != null && mapExistingAdd.get(mapAccIdToDelete.get(accId)).size() > 0){
+                            for(Address__c objExAdd : mapExistingAdd.get(mapAccIdToDelete.get(accId))){
+                                if(objExAdd.AddressId__c == objAdd.AddressId__c){
+                                    objExAdd.Company_Name__c=objAdd.Company_Name__c != null && objAdd.Company_Name__c != '' ? objAdd.Company_Name__c : '--';
+                                    objExAdd.Address_Line_1__c=objAdd.Address_Line_1__c;
+                                    objExAdd.Address_Line_2__c=objAdd.Address_Line_2__c;
+                                    objExAdd.Address_Line_3__c=objAdd.Address_Line_3__c;
+                                    objExAdd.District__c=objAdd.District__c;
+                                    objExAdd.City__c=objAdd.City__c;
+                                    objExAdd.State__c=objAdd.State__c;
+                                    objExAdd.PIN_Code__c=objAdd.PIN_Code__c;
+                                    objExAdd.Address_Type__c=objAdd.Address_Type__c;
+                                    objExAdd.IsDefaultShippingAddress__c=objAdd.IsDefaultShippingAddress__c;
+                                    objExAdd.Complete_Address_Line__c=objAdd.Complete_Address_Line__c;
+                                    objExAdd.IsBillingAddress__c=objAdd.IsBillingAddress__c;
+                                    addToUpdate.add(objExAdd);
+                                    addToDelete.add(objAdd);
+                                }
+                            }
+                        }
+                        objAdd.Account__c = mapAccIdToDelete.get(accId);
+                        addToUpdate.add(objAdd);
+                    }
+                }
+            }
+            if(addToUpdate != null && addToUpdate.size() > 0){
+                try {
+                    update addToUpdate;
+                } Catch(Exception e){
+                    
+                }
+            }
+            if(addToDelete != null && addToDelete.size() > 0){
+                try {
+                    delete addToDelete;
+                } Catch(Exception e){
+                    
+                }
+                
+            }
+            if(conToUpdate != null && conToUpdate.size() > 0){
+                
+                try {
+                    update conToUpdate;
+                } Catch(Exception e){
+                    
+                }
+            }
+            if(conToDelete != null && conToDelete.size() > 0){
+                try {
+                    delete conToDelete;
+                } Catch(Exception e){
+                    
+                }
+                
+            }
+        }
+        if(lstAcc != null && lstAcc.size() > 0){
+            database.delete(lstAcc,false);
+        }
+    }
+    
+    public static string moengageRegistrationEvent(Account objAccount,boolean isLead){
+        //SFTRK-539
+        MoengageWrapEvent objEventWrap = new MoengageWrapEvent();
+        objEventWrap.type                                	=     'event';
+        objEventWrap.customer_id                         	=     objAccount.Account_Sf_ID__c;
+        List<MoengageWrapEvent.cls_actions> aclist  		=     new List<MoengageWrapEvent.cls_actions>();
+        MoengageWrapEvent.cls_actions ac            		=     new MoengageWrapEvent.cls_actions(); 
+        ac.action                                   		=     'USER-REGISTERED';
+        MoengageWrapEvent.cls_attributes eventAttr       	=     new MoengageWrapEvent.cls_attributes();
+        eventAttr.isLead                            		=     isLead;
+        ac.attributes                               		=     eventAttr;
+
+        aclist.add(ac);
+        objEventWrap.actions                                =     aclist;    
+        //String eventPayload = JSON.serialize(objEventWrap);
+        //SFTRK-539
+        if(!System.isFuture() && !System.isBatch()){// added System.isFuture and isBatch on 13th May 2025 to fix nested batch issue
+            MoengageAPI.eventCreation(JSON.serialize(objEventWrap),objAccount.Id);
+
+        }
+        return '';
+    }
+
+    
+    //Tilak - Have clubbed two methods - moengageMissedCallEvent, moengageQualificationEvent
+    public void jswMoengageEvent(List<Account> triggerNew,Map<Id,Account> oldMap){
+
+        Id msmeRecordTypeId = Schema.SObjectType.Account.getRecordTypeInfosByDeveloperName().get('Business_Account').getRecordTypeId();
+        
+        for(Account objAcc : triggerNew){
+            
+            if(objAcc.Registered__c == true || objAcc.RecordTypeId != msmeRecordTypeId){
+                continue;
+            }
+            Boolean isValidRec = false;
+            
+            MoengageWrapEvent objEventWrap = new MoengageWrapEvent();
+            objEventWrap.type = 'event';
+            objEventWrap.customer_id = objAcc.Account_Sf_ID__c;
+            
+            MoengageWrapEvent.cls_attributes eventAttr = new MoengageWrapEvent.cls_attributes();
+            eventAttr.Accountownername = objAcc.Account_Owner_Name__c; // Set account owner name
+            
+            List<MoengageWrapEvent.cls_actions> aclist = new List<MoengageWrapEvent.cls_actions>();
+            
+            MoengageWrapEvent.cls_actions ac = new MoengageWrapEvent.cls_actions();
+            
+            if (objAcc.Account_Status__c == 'Qualification Pending' && objAcc.Number_of_Calls_Attempted__c != oldMap.get(objAcc.Id).Number_of_Calls_Attempted__c && objAcc.Number_of_Calls_Answered__c == oldMap.get(objAcc.Id).Number_of_Calls_Answered__c){                    
+                ac.action = 'MISSED-CALL-UNQ';
+                ac.attributes = eventAttr;
+                aclist.add(ac);
+                
+                objEventWrap.actions = aclist;
+
+
+                
+                isValidRec = true;
+            }
+            
+            if(objAcc.Account_Status__c == 'Qualified Not Registered' && oldMap.get(objAcc.Id).Account_Status__c == 'Qualification Pending'){
+                ac.action = 'SHARE-REGISTRATION-LINK';
+                ac.attributes = eventAttr;
+                aclist.add(ac);
+                
+                objEventWrap.actions = aclist;
+                
+                isValidRec = true;
+            }
+            
+            if(isValidRec && !System.isBatch() && !System.isFuture()){// added System.isFuture and isBatch on 13th May 2025 to fix nested batch issue
+                String eventPayload = JSON.serialize(objEventWrap);
+                MoengageAPI.eventCreation(eventPayload,objAcc.Id);                
+            }
+            
+        }
+        
+    }
+
+    public static void createContactsForNewAccounts(List<Account> newAccounts) {
+        List<Contact> contactsToInsert = new List<Contact>();
+        
+        Id retailRecordTypeId = Schema.SObjectType.Account.getRecordTypeInfosByDeveloperName().get('Retail').getRecordTypeId();
+        
+        for(Account acc : newAccounts){
+
+            if(acc.RecordTypeId == retailRecordTypeId ){ //&& (acc.customer_type_account__c  == 'Retailer PB' || acc.customer_type_account__c  == 'Influencer')
+                Contact newContact = new Contact(
+                    LastName = acc.Contact_Name__c,
+                    AccountId = acc.Id,
+                    Email = acc.Email__c,
+                    MobilePhone = acc.Company_Phone__c,
+                    Designation_multiselect__c = acc.Primary_contact_designation__c
+                );
+                contactsToInsert.add(newContact);
+
+            }
+        }
+        
+        if (!contactsToInsert.isEmpty()) {
+            try {
+                insert contactsToInsert;
+            } catch (DmlException e) {
+                System.debug('Error inserting contacts in AccountTriggerHandler ContactCreation >>' + e.getMessage());
+                HandleCustomException.LogException(e,null,null);
+            }
+        }
+    }
+    
+    //SF-3601
+    public static void updatePanFromGst(List<Account> accounts, Map<Id, Account> oldMap) {
+
+        /*String profileName;
+        
+        if(UserInfo.getProfileId() != null){
+            List<Profile> userProfile = [SELECT Id,Name FROM Profile WHERE Id = :UserInfo.getProfileId() Limit 1];
+            if(!userProfile.isEmpty()){
+                profileName = userProfile[0].Name;                
+            }
+        }
+        if(String.isBlank(profileName)){ profileName = 'Integration user'; }*/
+       /* String profileName = cachedProfileName;
+        
+        if(profileName == null && UserInfo.getProfileId() != null){
+            List<Profile> userProfile = [SELECT Id,Name FROM Profile WHERE Id = :UserInfo.getProfileId() Limit 1];
+            if(!userProfile.isEmpty()){
+                profileName = userProfile[0].Name;                
+            }
+        }
+        if(String.isBlank(profileName)){ profileName = 'Integration user'; }
+        cachedProfileName = profileName*/ //SF-5725 commented out, moved to validation rule
+        
+        for (Account acc : accounts) {
+            Account oldAccount = oldMap != null ? oldMap.get(acc.Id) : null;
+            
+          /*  if (oldAccount != null && acc.Registered__c && oldAccount.PAN__c != acc.PAN__c && !profileName.toLowerCase().contains('integration')) {
+                acc.addError('PAN cannot be updated after account registration.');
+                continue; 
+            }*/ //SF-5725 commented out movedt to validation rule
+            
+            if (!String.isBlank(acc.GST__c) && (oldAccount == null || oldAccount.GST__c != acc.GST__c)) {
+                acc.PAN__c = acc.GST__c.substring(2, 12);
+            }
+        }
+    }
+    
+    //SF-3441 -->starts
+    public static void updatePayToForNewAccounts(List<Account> newAccounts, Boolean isBeforeInsert){
+        
+        Set<String> panSet = new Set<String>(); 
+        for (Account acc: newAccounts){
+            if(acc.PAN__c != null && acc.Registered__c){
+                panSet.add(acc.PAN__c);
+            }
+        }
+        
+        if(panSet.isEmpty()) return;
+        
+        List<Account> existingAcc;
+        if (isBeforeInsert) {
+            existingAcc = [SELECT Id, PAN__c, Pay_to__c, Registered__c FROM Account WHERE Registered__c = TRUE AND PAN__c IN :panSet AND Pay_to__c != NULL
+                           ORDER BY CreatedDate DESC];
+        } else {
+            existingAcc = [SELECT Id, PAN__c, Pay_to__c, Registered__c FROM Account WHERE Registered__c = TRUE AND PAN__c IN :panSet AND Pay_to__c != NULL 
+                           AND Id NOT IN :newAccounts ORDER BY CreatedDate DESC];
+        }
+        
+        Map<String, Account> existingAccMap = new Map<String, Account>();
+        for (Account acc : existingAcc) {
+            if (!existingAccMap.containsKey(acc.PAN__c)) {
+                existingAccMap.put(acc.PAN__c, acc);
+            }
+        }
+        List<Account> accountsToUpdate = new List<Account>();
+        
+        for (Account acc : newAccounts) { 
+            String newPayto = existingAccMap.containsKey(acc.PAN__c) ? existingAccMap.get(acc.PAN__c).Pay_to__c : 'JOPL Nodal'; 
+            
+            if(isBeforeInsert && acc.Pay_to__c != newPayto){
+                acc.Pay_to__c =newPayto;
+            }
+            
+            if(!isBeforeInsert){
+                accountsToUpdate.add(new Account(Id = acc.Id, Pay_to__c = newPayTo));
+            }           
+        }
+        if (!accountsToUpdate.isEmpty() && !isBeforeInsert) {
+            update accountsToUpdate;
+        }
+    }
+    
+    public static void updatePayToForExisitngAccounts(List<Account> newAccount, Map<Id, Account> oldMap){ 
+        if (hasRunUpdatePayTo) {
+            return; 
+        }
+        hasRunUpdatePayTo = true;// SF-5725
+        Set<String> panSet = new Set<String>();
+        Map<String, String> panAndpayTo = new Map<String, String>();
+        List<Account> AccList = new List<Account>();
+        Map<String, String> existingAccountMap = new Map<String, String>();
+        
+        for(Account acc : newAccount){
+            if(acc.Registered__c != oldMap.get(acc.Id).Registered__c && acc.PAN__c != null){
+                AccList.add(acc);  
+            }
+            else if(acc.PAN__c != null && acc.Pay_to__c != oldMap.get(acc.Id).Pay_to__c){
+                panAndpayTo.put(acc.PAN__c,acc.Pay_to__c);
+            }
+        }
+        
+        if(!AccList.isEmpty()){
+            AccountTriggerhandler.updatePayToForNewAccounts(AccList,false);
+            return;
+        }
+
+
+        if(panAndpayTo.isEmpty()) return; 
+        List<Account> accountToUpdate = [SELECT Id, PAN__c, Pay_to__c,Registered__c FROM Account WHERE PAN__c IN :panAndpayTo.keyset() AND Registered__c = TRUE
+                                         AND Id NOT IN : newAccount];
+        System.debug('ExistingAccountList::'+ accountToUpdate);
+        List<Account> updatedAccounts = new List<Account>(); 
+        
+        For(Account ExistAcc : accountToUpdate){
+            existingAccountMap.put(ExistAcc.PAN__c, ExistAcc.Pay_to__c);
+            if ( panAndpayTo.get(existAcc.PAN__c) != null && panAndpayTo.get(existAcc.PAN__c) != ExistAcc.Pay_to__c) { 
+                ExistAcc.Pay_to__c = panAndpayTo.get(ExistAcc.PAN__c); 
+                updatedAccounts.add(existAcc);   
+            }
+        }
+        System.debug('Updated AcocuntList::'+ updatedAccounts);
+        
+        if (updatedAccounts.isEmpty()) return;
+        
+        if(FeatureManagement.checkPermission('Enable_Pay_to_Access')){
+            update updatedAccounts;
+        } 
+        else{
+            for(Account acc : newAccount){
+                if(acc.PAN__c != null && existingAccountMap.containsKey(acc.PAN__c)){
+                    acc.addError('You do not have access to edit');
+                }
+            }
+        }       
+    }
+    //SF-3441--> Ends
+    
+    //SF-3585 - added by pranav , start
+    public static void updateVAN(List<Account> newAccountList, Map<Id, Account> oldMap){
+
+
+
+        list<string> gstinList = new list<string>();
+        Id distributorRecordTypeId = Schema.SObjectType.Account.getRecordTypeInfosByDeveloperName().get('Distributor').getRecordTypeId();
+        list<account> filteredAccounts = new list<account>();
+        
+        for(account acc : newAccountList){
+            
+            if (oldMap != null && oldMap.containsKey(acc.Id)){
+                // Trigger context is before update
+                Account oldAcc = oldMap.get(acc.Id);
+                
+                if( ( (oldAcc.Registered__c == false && acc.Registered__c == true) || (acc.Registered__c == true && (oldAcc.Pay_to__c != acc.Pay_to__c || oldAcc.Nodal_Bank_Account__c != acc.Nodal_Bank_Account__c || oldAcc.Non_Nodal_Bank_Account__c != acc.Non_Nodal_Bank_Account__c ))) //for registered accounts //SF-3921-added Non_Nodal_Bank_Account__c
+
+                   || ( acc.Registered__c == false && acc.RecordTypeId == distributorRecordTypeId && (oldAcc.Pay_to__c != acc.Pay_to__c || oldAcc.Nodal_Bank_Account__c != acc.Nodal_Bank_Account__c  || oldAcc.Non_Nodal_Bank_Account__c != acc.Non_Nodal_Bank_Account__c )) //for dist accounts
+                  ){
+                      gstinList.add(acc.GST__c);
+                      filteredAccounts.add(acc);
+                  }
+            }
+            else if (acc.Registered__c == true || acc.RecordTypeId == distributorRecordTypeId){
+                // Trigger context is after insert
+                gstinList.add(acc.GST__c);
+                filteredAccounts.add(acc);
+            }
+        }//for end
+        
+        if(gstinList != null && !gstinList.isEmpty() && gstinList.size() > 0 && gstinList[0] != null ){
+
+
+            map<string,string> gstVanMap = JSW_VANGenerator.generateUniqueVANs(gstinList);
+            JSW_VANGenerator.tagVanToAccounts(gstVanMap,filteredAccounts);
+        }
+
+        
+    }
+    //SF-3585 - added by pranav , end
+    //SF-4750: Start
+    public static void gstUpdatedForRegisteredCustomer(Map<Id,Account> oldAccountMap, Map<Id, Account> newAccountMap){
+        String requestBody;
+        for(Account objAccount: newAccountMap.values()){
+            if(objAccount.GST__c != oldAccountMap.get(objAccount.Id).GST__c && oldAccountMap.get(objAccount.Id).Registered__c && oldAccountMap.get(objAccount.Id).Registered__c == objAccount.Registered__c){
+                requestBody = '{"text":"Account: ' + objAccount.Name + '(' + objAccount.Id +')' + 
+                    ' changed from ' + (oldAccountMap.get(objAccount.Id).GST__c == null?'blank':oldAccountMap.get(objAccount.Id).GST__c)  + ' to ' + (objAccount.GST__c ==null?'blank':objAccount.GST__c) + '"}';
+                JSW_SendAlertToTeams.sendAlertToTeamsChannel(requestBody, 'TeamsAlert_GSTUpdate');
+            }
+        }
+        
+        
+    }
+    //SF-4750: End
+    public static void syncAnnualTurnoverToOpportunity(List<Account> newList, Map<Id, Account> oldMap) {
+        if (Opportunity_Trg_Handler.annualTurnoverSyncRunning) return;
+
+        Map<Id, String> turnoverByAccountId = new Map<Id, String>();
+
+        for (Account acc : newList) {
+            Account oldAcc = oldMap.get(acc.Id);
+            if (acc.Annual_Turnover_Cr__c != oldAcc.Annual_Turnover_Cr__c) {
+                turnoverByAccountId.put(acc.Id, acc.Annual_Turnover_Cr__c);
+            }
+        }
+
+        if (turnoverByAccountId.isEmpty()) return;
+
+        List<Opportunity> oppsToUpdate = [SELECT Id, AccountId, Annual_Turnover_Cr__c FROM Opportunity WHERE AccountId IN :turnoverByAccountId.keySet()
+            							  AND RecordType.DeveloperName = 'Credit' AND IsClosed = false];
+
+        for (Opportunity opp : oppsToUpdate) {
+            opp.Annual_Turnover_Cr__c = turnoverByAccountId.get(opp.AccountId);
+        }
+
+        if (!oppsToUpdate.isEmpty()) {
+            Opportunity_Trg_Handler.annualTurnoverSyncRunning = true;
+            AccountTriggerHandler.accountTriggerStop = true;
+            update oppsToUpdate;
+            AccountTriggerHandler.accountTriggerStop = false;
+            Opportunity_Trg_Handler.annualTurnoverSyncRunning = false;
+        }
+    }
+    
+    public static void sendVANDetailsNotification(Set<Id> accountIds, String eventName) { //JSWOC-22336-22351
+        if (accountIds == null || accountIds.isEmpty()) {
+            return;
+        }
+    
+        System.enqueueJob(
+            new JSW_VANNotificationQueueable(accountIds, eventName)
+        );
+    }
+}
+
+//Commented part moved here:::::::::::::
+//
+//      //List<User> lstIntegrationUser = [SELECT Id FROM User WHERE Name = 'Integration User' LIMIT 1];
+//      
+/* 
+            if(objAcc.Registered__c == true){
+                objAcc.Registration_Date_Time__c = system.now();
+                if(objAcc.OwnerId != null){
+                  objAcc.Registered_by__c = objAcc.OwnerId;
+                }else if(!lstIntegrationUser.isEmpty()){
+                objAcc.Registered_by__c = lstIntegrationUser[0].Id;
+              }
+            }*/
+            /*if(objAcc.Customer_Type_Account__c == 'Small' || objAcc.Customer_Type_Account__c == 'Medium' || objAcc.Customer_Type_Account__c == 'Enterprise' || objAcc.Customer_Type_Account__c == 'Aggregators' || objAcc.Customer_Type_Account__c == 'Institutional'){
+              objAcc.Business_division__c = 'Manufacturing';
+            }*/
+
+//List<User> lstIntegrationUser = [SELECT Id FROM User WHERE Name = 'Integration User' LIMIT 1];
+       // Id msmeRecordTypeId =  [SELECT Id FROM RecordType WHERE DeveloperName = 'Business_Account' and SObjectType = 'Account'].Id;//SF-502 start 
+       // 
+
+                    
+                    /*
+if(objAcc.OwnerId != null){
+objAcc.Registered_by__c = objAcc.OwnerId;
+}else if(!lstIntegrationUser.isEmpty()){
+objAcc.Registered_by__c = lstIntegrationUser[0].Id;
+}*/
+
+/* Modified Code
+public void moengageEvent(List<Account> triggerNew, Map<Id, Account> oldMap) {
+Id msmeRecordTypeId = [SELECT Id FROM RecordType WHERE DeveloperName = 'Business_Account' and SObjectType = 'Account'].Id;
+for (Account objAcc : triggerNew) {
+MoengageWrapEvent objEventWrap = new MoengageWrapEvent();
+objEventWrap.type = 'event';
+objEventWrap.customer_id = objAcc.Account_Sf_ID__c;
+List<MoengageWrapEvent.cls_actions> aclist = new List<MoengageWrapEvent.cls_actions>();
+
+MoengageWrapEvent.cls_actions ac = new MoengageWrapEvent.cls_actions();
+MoengageWrapEvent.cls_attributes eventAttr = new MoengageWrapEvent.cls_attributes();
+eventAttr.Accountownername = objAcc.Account_Owner_Name__c; // Set account owner name
+
+String actionName = '';
+if (objAcc.Account_Status__c == 'Qualification Pending' && objAcc.Registered__c == false
+&& objAcc.Number_of_Calls_Attempted__c != oldMap.get(objAcc.Id).Number_of_Calls_Attempted__c
+&& objAcc.Number_of_Calls_Answered__c == oldMap.get(objAcc.Id).Number_of_Calls_Answered__c
+&& objAcc.RecordTypeId == msmeRecordTypeId) {
+actionName = 'MISSED-CALL-UNQ';
+} else if (objAcc.Account_Status__c == 'Qualified Not Registered'
+&& oldMap.get(objAcc.Id).Account_Status__c == 'Qualification Pending'
+&& objAcc.RecordTypeId == msmeRecordTypeId && objAcc.Registered__c == false) {
+actionName = 'SHARE-REGISTRATION-LINK';
+}
+
+if (actionName == '') { // Check if the action name is empty
+ac.action = '';
+ac.attributes = eventAttr;
+aclist.add(ac);
+objEventWrap.actions = aclist;
+String eventPayload = JSON.serialize(objEventWrap);
+MoengageAPI.eventCreation(eventPayload, objAcc.Id);
+}
+}
+}
+
+*/ 
+//End here
+
+/*    
+    //added by kavish
+    public void moengageMissedCallEvent(List<Account> triggerNew,Map<Id,Account> oldMap){
+        
+        Id msmeRecordTypeId = Schema.SObjectType.Account.getRecordTypeInfosByDeveloperName().get('Business_Account').getRecordTypeId();
+        for(Account objAcc : triggerNew){
+            
+            if (objAcc.Account_Status__c == 'Qualification Pending' && objAcc.Registered__c ==False
+                && objAcc.Number_of_Calls_Attempted__c != oldMap.get(objAcc.Id).Number_of_Calls_Attempted__c 
+                && objAcc.Number_of_Calls_Answered__c == oldMap.get(objAcc.Id).Number_of_Calls_Answered__c
+                && objAcc.RecordTypeId == msmeRecordTypeId){
+                    
+                    MoengageWrapEvent objEventWrap = new MoengageWrapEvent();
+                    objEventWrap.type = 'event';
+                    objEventWrap.customer_id = objAcc.Account_Sf_ID__c;
+                    
+                    List<MoengageWrapEvent.cls_actions> aclist = new List<MoengageWrapEvent.cls_actions>();
+                    
+                    MoengageWrapEvent.cls_actions ac = new MoengageWrapEvent.cls_actions(); 
+                    ac.action = 'MISSED-CALL-UNQ';
+                    
+                    MoengageWrapEvent.cls_attributes eventAttr = new MoengageWrapEvent.cls_attributes();
+                    eventAttr.Accountownername = objAcc.Account_Owner_Name__c; // Set account owner name
+                    
+                    ac.attributes = eventAttr;
+                    aclist.add(ac);
+                    objEventWrap.actions = aclist;    
+                    String eventPayload = JSON.serialize(objEventWrap);
+                    
+                    if(!System.isBatch() && !System.isFuture()){ // added System.isFuture and isBatch on 13th May 2025 to fix nested batch issue
+                        MoengageAPI.eventCreation(eventPayload,objAcc.Id);
+                    }
+                    
+                }
+        }
+    }
+    
+    // QP → QNR stage change  Event name: SHARE-REGISTRATION-LINK
+    public void moengageQualificationEvent(List<Account> triggerNew,Map<Id,Account> oldMap){
+        //Checks if the Stage is changed from QP --> QNR
+        Id msmeRecordTypeId = Schema.SObjectType.Account.getRecordTypeInfosByDeveloperName().get('Business_Account').getRecordTypeId();
+        
+        for(Account objAcc : triggerNew){
+            
+            if (objAcc.Account_Status__c == 'Qualified Not Registered'
+                && oldMap.get(objAcc.Id).Account_Status__c == 'Qualification Pending'
+                && objAcc.RecordTypeId == msmeRecordTypeId && objAcc.Registered__c ==False){
+                    
+                    MoengageWrapEvent objEventWrap = new MoengageWrapEvent();
+                    objEventWrap.type = 'event';
+                    objEventWrap.customer_id = objAcc.Account_Sf_ID__c;
+                    
+                    List<MoengageWrapEvent.cls_actions> aclist = new List<MoengageWrapEvent.cls_actions>();
+                    
+                    MoengageWrapEvent.cls_actions ac = new MoengageWrapEvent.cls_actions(); 
+                    ac.action = 'SHARE-REGISTRATION-LINK';
+                    
+                    MoengageWrapEvent.cls_attributes eventAttr = new MoengageWrapEvent.cls_attributes();
+                    eventAttr.Accountownername = objAcc.Account_Owner_Name__c; // Set account owner name
+                    
+                    ac.attributes = eventAttr;
+                    aclist.add(ac);
+                    objEventWrap.actions = aclist;    
+                    String eventPayload = JSON.serialize(objEventWrap);
+
+                    if(!System.isBatch() && !System.isFuture()){ // added System.isFuture and isBatch on 13th May 2025 to fix nested batch issue
+                        MoengageAPI.eventCreation(eventPayload,objAcc.Id);
+                    }
+                    
+                }
+        }
+    }
+*/
