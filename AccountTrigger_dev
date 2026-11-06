@@ -1,0 +1,234 @@
+/*
+Trigger to handle the account Automations 
+
+* 09/05/2025 - accountTriggerStop added this static variable to bypass SOQL 101 as part of SF-3753
+* 14-05-2025 - SF-3921, added conditions to trigger JSW_ZohoCustomerDataSync, pranav
+* 09-06-2025 - SF-4126, added recursion check conditions, Nagarjuna
+* 08-08-2025 - chnage made by tilak - Account Trigger Optimisation SF-4373
+* 24-02-2026 - Tilak - SF-5199 - Business div PB accounts will be assigned via UCT 'accountAllocationPB'custom setting added
+* 16-07-2026 - SF-5417 - Ship_to_Account RecordType filter added before zoho sync call 
+* 02-11-2026 - Lohit - JSWOC-22351 - Added sync VAN Details on Account's payTo migration
+
+*/
+
+trigger AccountTrigger ON Account (before insert,after insert, before update, after update)
+{
+    
+    if(AccountTriggerHandler.accountTriggerStop == true){
+        return;
+    }
+    
+    public static boolean isUrlUpdated = true;
+    
+    TriggerSwitch__c TriggerSwitchAccount = TriggerSwitch__c.getValues('account');
+    
+    if(Trigger.isAfter && Trigger.isUpdate){
+        
+        if(TriggerSwitchAccount != null && TriggerSwitchAccount.Enabled__c == true){
+            
+            AccountTriggerHandler handlerClass= new AccountTriggerHandler();
+            handlerClass.afterUpdateMethod(Trigger.New,Trigger.OldMap);
+            //handlerClass.moengageMissedCallEvent(Trigger.New,Trigger.OldMap); //clubbed in jswMoengageEvent SF-4373
+            //handlerClass.moengageQualificationEvent(Trigger.New,Trigger.OldMap); //clubbed in jswMoengageEvent SF-4373
+            handlerClass.jswMoengageEvent(Trigger.New,Trigger.OldMap);
+            
+            //SF-1311: Added for Early Knock Off
+            handlerClass.earlyknockOff(Trigger.newMap, Trigger.oldMap);
+            
+            //Methods to consume MSME App API - SF-3433, start
+            JSW_MSMEAppAPIHandler.notifyMSMEAppHandler(Trigger.New,Trigger.OldMap);
+            //Methods to consume MSME App API - SF-3433, end
+            AccountTriggerHandler.updatePayToForExisitngAccounts(trigger.new, trigger.oldmap);//SF-3441
+            
+        }
+        
+        //SF-1031 Account Priority
+        TriggerSwitch__c apl = TriggerSwitch__c.getValues('accountPriorityLogic');
+        if(apl != null && apl.Enabled__c == true){
+            JSW_CustomPriorityAccount objAccPriority= new JSW_CustomPriorityAccount();
+            objAccPriority.RegisteredAccountCheck(Trigger.New, Trigger.OldMap);
+        }
+        //SF-1031 End
+        
+    }
+    
+    if(Trigger.isAfter && Trigger.isInsert){
+        
+        if(TriggerSwitchAccount != null && TriggerSwitchAccount.Enabled__c == true){
+            AccountTriggerHandler handlerClass= new AccountTriggerHandler();
+            handlerClass.afterInsertMethod(Trigger.New,Trigger.OldMap);
+        }
+        
+        List<Account> accountList = new List<Account>();
+        for(account acc : trigger.new){
+            if(acc.IsJSWOneRecord__c){
+                isUrlUpdated = false;
+                Account updateNewAccount = new Account();
+                updateNewAccount.Id = acc.Id;
+                updateNewAccount.Approval_History_URL__c = 'https://jswsteelcustomer.secure.force.com/approvalhistory/?id='+acc.Id; //'https://qa-jswsteelcustomer.cs117.force.com/forone/?id='+acc.Id; 
+                accountList.add(updateNewAccount);
+            }
+        }
+        if(!accountList.isEmpty()){
+            update accountList;
+        }
+        
+        //SF-2316
+        JSWSteelAccountsTriggerHandler.createAddressRecordForJSWSteelAccount(Trigger.New);
+        JSWSteelAccountsTriggerHandler.ConnectJSWSteelToOne(Trigger.New);//Method is created to connect JSW steel synced customers with existing JSW One direct customers
+        
+        
+        AccountTriggerHandler.createContactsForNewAccounts(Trigger.new);//SF-3520
+        JSWSteelAccountsTriggerHandler.markJGTMAccountsUpdated(Trigger.New);          
+    }
+    
+    if(Trigger.isBefore && Trigger.isInsert){
+        
+        if(TriggerSwitchAccount != null && TriggerSwitchAccount.Enabled__c == true){
+            List<Account> listOfNonSteelAccounts = new List<Account>();
+            for(Account acc : Trigger.New){
+                if(acc.AccountSource != 'JSW One'){
+                    listOfNonSteelAccounts.add(acc);
+                }        
+            }
+            if(!listOfNonSteelAccounts.isEmpty()){
+                AccountTriggerHandler handlerClass= new AccountTriggerHandler();
+                handlerClass.beforeInsertMethod(listOfNonSteelAccounts);
+            }
+        }
+        
+        //SF-3585, pranav
+        AccountTriggerHandler.updateVAN(trigger.new, null);
+        
+        JSWSteelAccountsTriggerHandler.updateSteelAccountsRecordType(Trigger.New);
+        
+        //SF-2961
+        JSWSteelAccountsTriggerHandler.createAccountHistoryString(trigger.new);
+        AccountTriggerHandler.updatePanFromGst(trigger.new, null); //SF3601
+        AccountTriggerHandler.updatePayToForNewAccounts(trigger.new, true);
+    }
+    
+    if(Trigger.isBefore && Trigger.isUpdate){
+        
+        if(TriggerSwitchAccount != null && TriggerSwitchAccount.Enabled__c == true){
+            AccountTriggerHandler handlerClass= new AccountTriggerHandler();
+            handlerClass.beforeUpdateMethod(Trigger.New,Trigger.OldMap);
+        }
+        
+        AccountApprovalHandler.handleApprovalAndRejection(trigger.new, trigger.oldMap);
+        
+        //SF-3585, pranav
+        AccountTriggerHandler.updateVAN(trigger.new, trigger.oldmap);
+        
+        //Sf-2316
+        if(JSW_ZohoCustomerDataSync.isSyncStart == false){
+            
+            List<Account> zohoUpdateAccounts = new List<Account>();
+            JSW_ZohoCustomerDataSync oZohoSync = new JSW_ZohoCustomerDataSync();
+            Boolean isRegisteredChange = false;
+                        
+            for(Account acc : Trigger.New){
+                
+                Account old;
+                if(Trigger.isUpdate){
+                    old = Trigger.oldMap.get(acc.Id);
+                }
+                
+                if(acc.RecordTypeId != null && acc.RecordType.DeveloperName != 'Ship_to_Account' && acc.RecordType.DeveloperName != 'Seller_Account' && acc.Registered__c == true && acc.Name != null && acc.GST__c != null ){
+                    
+                    //SF-2753: Added checks to ensure customer update sync runs only on update of the specified fields in the contract
+                    //SF-3293 : Added more fields 
+                    //SF-3441: Added PayTo Parameter
+                    
+                    if((acc.Zoho__c && old.AccountNumber!=acc.AccountNumber) || old.Customer_PAN__c!=acc.Customer_PAN__c || 
+                       old.Nodal_Bank_Account__c!=acc.Nodal_Bank_Account__c || old.GST__c!=acc.GST__c || old.Name!=acc.Name || old.Email__c !=acc.Email__c || 
+                       old.Company_Phone__c!=acc.Company_Phone__c || old.Customer_Type_Account__c != acc.Customer_Type_Account__c || old.Business_division__c !=acc.Business_division__c 
+                       || !acc.Zoho__c || old.Pay_to__c != acc.Pay_to__c 
+                       || acc.JSW_NonNodalBankVAN__c != old.JSW_NonNodalBankVAN__c || acc.JSW_NodalBankVAN__c != old.JSW_NodalBankVAN__c 
+                       || old.Segment__c != acc.Segment__c || old.Sub_segment__c != acc.Sub_Segment__c || old.RecordTypeId != acc.RecordTypeId //SF-5133: Added segment, sub-segment and record type
+                      ){//SF-3921, pranav
+                          JSW_ZohoCustomerDataSync.isSyncStart = true;
+                          JSW_ZohoCustomerDataSync.ZohoRequestData oZoho = new JSW_ZohoCustomerDataSync.ZohoRequestData();
+                          oZoho.accountId = acc.Id;
+                          oZoho.isInsertAccount = acc.Zoho__c == false ? true : false;
+                          oZohoSync.lstJohoDetails.add(oZoho);
+                          
+                      }
+                }
+            }
+            
+            if(!oZohoSync.lstJohoDetails.isEmpty()){
+                System.enqueueJob(oZohoSync);
+            }
+        }
+        
+        //SF-2961
+        JSWSteelAccountsTriggerHandler.updateAccountHistoryString(trigger.new, trigger.oldmap);
+        AccountTriggerHandler.updatePanFromGst(trigger.new, trigger.oldmap);//SF-3601
+        
+    }
+    
+    
+    //added on 16-10-2023-- Tilak SF-1535
+    TriggerSwitch__c myCS1 = TriggerSwitch__c.getValues('accountAllocation');
+    TriggerSwitch__c myCS2 = TriggerSwitch__c.getValues('accountAllocationPB');//SF-5199
+    if((myCS1 != null && myCS1.Enabled__c == true) || (myCS2 != null && myCS2.Enabled__c == true) ){
+        if( Trigger.isBefore && Trigger.isInsert ){
+            JSW_AccountAllocationCustom accountAllocation1 = new JSW_AccountAllocationCustom();
+            accountAllocation1.beforeTrigger( Trigger.New );
+        }
+        if( Trigger.isBefore && Trigger.isUpdate && JSW_AccountAllocationCustom.runonceaccountAllocationUpdate == false ){  // added by Nagarjuna for recursion 
+            JSW_AccountAllocationCustom accountAllocation2 = new JSW_AccountAllocationCustom();
+            accountAllocation2.beforeUpdateMethod(Trigger.New, Trigger.OldMap);
+            JSW_AccountAllocationCustom.runonceaccountAllocationUpdate = true;    // added by Nagarjuna for recursion 
+        }
+    }
+    
+    //SF-1535 END
+    if(Trigger.isAfter && Trigger.isUpdate){
+        JSW_FieldChangeEventPublisher.publishFieldChanges(Trigger.oldMap, Trigger.newMap, 'Account');
+        AccountTriggerHandler.gstUpdatedForRegisteredCustomer(Trigger.oldMap, Trigger.newMap);
+        AccountTriggerHandler.syncAnnualTurnoverToOpportunity(Trigger.New, Trigger.OldMap);//SF-5280
+        
+        //JSWOC-22351 start
+        Set<Id> accountIds = new Set<Id>();
+        
+        for (Account acc : Trigger.new) {
+            Account oldAcc = Trigger.oldMap.get(acc.Id);
+        
+            if (acc.Pay_to__c != oldAcc.Pay_to__c) {
+                accountIds.add(acc.Id);
+            }
+        }
+        if (!accountIds.isEmpty()) {
+            String payToMigrationEventName = EventName__c.getValues('payToMigration').Event_Name__c;
+            AccountTriggerHandler.sendVANDetailsNotification(
+                accountIds,
+                payToMigrationEventName
+            );
+        }
+        //JSWOC-22351 end
+    }
+    
+}
+
+
+
+//Commented protion moved at bottom of class:::
+
+//SF-3293 Commented as we are sending custometype and business division in JSW_ZohoCustomerDataSync.apxc
+/*if (Trigger.isAfter && (Trigger.isInsert || Trigger.isUpdate)) {
+AccountTriggerHandler.customerTypeandBusinessDivision(Trigger.new, Trigger.oldMap);
+
+} */  
+
+/*if(zohoUpdateAccounts.size()>0){
+System.debug('Zoho Accounts');
+JSW_ZohoCustomerDataSync.sendRequestToZoho(zohoUpdateAccounts,false); 
+System.debug('testtttt 4');
+}
+if(zohoInsertAccounts.size()>0){
+System.debug('Zoho Accounts');
+JSW_ZohoCustomerDataSync.sendRequestToZoho(zohoInsertAccounts,true); 
+System.debug('testtttt 5');
+}*/
